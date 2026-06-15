@@ -9,6 +9,10 @@ license = "MIT"
 name = "airfry"
 path = "src/main.rs"
 
+[[bin]]
+name = "airfry-ctl"
+path = "src/bin/airfry-ctl.rs"
+
 [dependencies]
 fpemu = { path = "../fpemu" }
 mdns-sd = "0.11"
