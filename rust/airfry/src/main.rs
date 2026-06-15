@@ -5,6 +5,7 @@
 //! (discovery, pairing, RTSP, mirror stream) is ported from doubletake
 //! (research-only submodule; see third_party/doubletake) — credit: omarroth.
 
+mod audio;
 mod capture;
 mod discovery;
 mod fairplay;
@@ -53,7 +54,7 @@ fn print_help() {
            airfry pair <host[:port]>  Connect + pair + fp-setup against a receiver\n  \
            airfry mirror <host[:port]>  Mirror this screen to the receiver\n  \
            airfry version             Print version\n\n\
-         mirror flags: [--fit <pct>] [--bitrate <kbps>] [--fps <n>] [--pin <pin>] [--sw] [--no-encrypt]",
+         mirror flags: [--fit <pct>] [--bitrate <kbps>] [--fps <n>] [--pin <pin>] [--sw] [--no-encrypt] [--no-audio] [--mute]",
         env!("CARGO_PKG_VERSION")
     );
 }
@@ -117,7 +118,7 @@ fn cmd_mirror(args: &[String]) -> i32 {
     let target = match args.get(2) {
         Some(t) => t.as_str(),
         None => {
-            eprintln!("usage: airfry mirror <host[:port]> [--fit <pct>] [--bitrate <kbps>] [--fps <n>] [--pin <pin>] [--sw] [--no-encrypt]");
+            eprintln!("usage: airfry mirror <host[:port]> [--fit <pct>] [--bitrate <kbps>] [--fps <n>] [--pin <pin>] [--sw] [--no-encrypt] [--no-audio] [--mute]");
             return 2;
         }
     };
@@ -156,6 +157,8 @@ fn cmd_mirror(args: &[String]) -> i32 {
             }
             "--sw" => opts.force_software_encoder = true,
             "--no-encrypt" => opts.no_encrypt = true,
+            "--no-audio" => opts.no_audio = true,
+            "--mute" => opts.mute_audio = true,
             other => {
                 eprintln!("unknown flag '{other}'");
                 return 2;

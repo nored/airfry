@@ -25,6 +25,12 @@ num-traits = "0.2"
 rand = "0.8"
 aes = "0.8"
 ctr = "0.9"
+cbc = "0.1"
+# Original (Bernstein "djb") ChaCha20 with a 64-bit nonce + Poly1305, used to
+# build the audio RTP AEAD that matches github.com/aead/chacha20poly1305
+# NewCipher (8-byte nonce), NOT the IETF 12-byte variant above.
+chacha20 = "0.9"
+poly1305 = "0.8"
 
 # screen capture + H.264 encode
 gstreamer = "0.23"

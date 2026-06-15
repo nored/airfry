@@ -43,6 +43,7 @@ use chacha20poly1305::ChaCha20Poly1305;
 use hkdf::Hkdf;
 use sha2::{Digest, Sha512};
 
+use crate::audio::{self, AudioSecurityMode};
 use crate::capture::{CaptureConfig, CaptureSource};
 use crate::rtsp::{Session, Transport};
 
@@ -57,6 +58,11 @@ pub struct MirrorOpts {
     pub force_software_encoder: bool,
     /// Disable per-frame video encryption (matches cfg.NoEncrypt). For debug.
     pub no_encrypt: bool,
+    /// Skip audio capture/streaming entirely (video-only mirror).
+    pub no_audio: bool,
+    /// Stream audio but tell the receiver to mute it (SET_PARAMETER volume
+    /// -144 dB). Audio frames are still sent.
+    pub mute_audio: bool,
 }
 
 impl Default for MirrorOpts {
@@ -67,6 +73,8 @@ impl Default for MirrorOpts {
             fps: 30,
             force_software_encoder: false,
             no_encrypt: false,
+            no_audio: false,
+            mute_audio: false,
         }
     }
 }
@@ -798,12 +806,70 @@ pub fn run_mirror_with_stop(
         std::thread::spawn(move || ntp_timing_responder(timing_sock, stop));
     }
 
-    // ---- Phase 1: audio SETUP (creates the session). Video-only: we still send
-    // it because current Apple receivers require the audio session first, but we
-    // do not stream audio. ----
+    // ---- Audio sockets: real senders allocate 3 consecutive UDP ports —
+    // timing(N), control(N+1), data(N+2) — and the receiver classifies incoming
+    // audio by source port. We bind the control + data sockets here so the
+    // declared controlPort in the SETUP descriptor matches the socket we will
+    // actually send sync packets from (audio.go setupMirrorSession). ----
+    let (audio_ctrl_conn, audio_data_conn) = if opts.no_audio {
+        (None, None)
+    } else {
+        match bind_audio_sockets() {
+            Ok((c, d)) => (Some(c), Some(d)),
+            Err(e) => {
+                eprintln!("[audio] could not bind audio UDP sockets: {e}; continuing without audio");
+                (None, None)
+            }
+        }
+    };
+    let audio_control_lport = audio_ctrl_conn
+        .as_ref()
+        .and_then(|c| c.local_addr().ok())
+        .map(|a| a.port())
+        .unwrap_or(0);
+
+    // ---- Audio security mode (mirror.go selectAudioSecurityMode + key gen):
+    // an encrypted (HAP / shared-secret) session uses ChaCha20-Poly1305 with a
+    // fresh random 32-byte direct stream key published via `shk`; otherwise the
+    // legacy AES-128-CBC path with the FairPlay key/IV. ----
+    let audio_mode = if !pair_shared_secret.is_empty() {
+        AudioSecurityMode::ChaCha
+    } else {
+        AudioSecurityMode::LegacyAes
+    };
+    let audio_chacha_key: Option<[u8; 32]> = if audio_mode == AudioSecurityMode::ChaCha {
+        let mut k = [0u8; 32];
+        rand::Rng::fill(&mut rand::thread_rng(), &mut k);
+        Some(k)
+    } else {
+        None
+    };
+    // Legacy AES path reuses the FairPlay stream key/IV (mirror.go: audioKey =
+    // c.fpKey, audioIV = c.fpIV). We map those onto stream_key/iv here.
+    let audio_aes_key: Option<[u8; 16]> = if audio_mode == AudioSecurityMode::LegacyAes {
+        Some(enc_key)
+    } else {
+        None
+    };
+    let audio_aes_iv: Option<[u8; 16]> = if audio_mode == AudioSecurityMode::LegacyAes {
+        Some(enc_iv)
+    } else {
+        None
+    };
+
+    // ---- Phase 1: audio SETUP (creates the session). ----
     let audio_stream_connection_id: i64 =
         (now_unix_nanos() & 0x7FFF_FFFF_FFFF_FFFF) as i64;
     let audio_uri = format!("rtsp://{host}:{port}/{audio_stream_connection_id}");
+
+    // redundantAudio: 2 when FEC is on (legacy), 0 for ChaCha (audio.go
+    // useAudioFEC); disableRetransmits when redundantAudio == 0.
+    let audio_redundant: i64 = if audio::use_audio_fec(audio_mode == AudioSecurityMode::ChaCha) {
+        2
+    } else {
+        0
+    };
+    let audio_latency_samples = audio::samples_for_44k1(Duration::from_millis(5));
 
     let mut audio_stream_desc = plist::Dictionary::new();
     audio_stream_desc.insert("type".into(), Value::Integer(96i64.into()));
@@ -815,14 +881,28 @@ pub fn run_mirror_with_stop(
     audio_stream_desc.insert("spf".into(), Value::Integer(352i64.into()));
     audio_stream_desc.insert("sr".into(), Value::Integer(44100i64.into()));
     audio_stream_desc.insert("audioFormat".into(), Value::Integer(0x40000i64.into()));
-    audio_stream_desc.insert("audioFormatIndex".into(), Value::Integer(1i64.into()));
-    audio_stream_desc.insert("controlPort".into(), Value::Integer(0i64.into()));
+    audio_stream_desc.insert("audioFormatIndex".into(), Value::Integer(0x12i64.into()));
+    audio_stream_desc.insert(
+        "controlPort".into(),
+        Value::Integer((audio_control_lport as i64).into()),
+    );
     audio_stream_desc.insert("audioMode".into(), Value::String("default".into()));
     audio_stream_desc.insert("usingScreen".into(), Value::Boolean(true));
-    audio_stream_desc.insert("latencyMin".into(), Value::Integer(11025i64.into()));
-    audio_stream_desc.insert("latencyMax".into(), Value::Integer(88200i64.into()));
-    audio_stream_desc.insert("redundantAudio".into(), Value::Integer(0i64.into()));
-    audio_stream_desc.insert("disableRetransmits".into(), Value::Boolean(true));
+    audio_stream_desc.insert(
+        "latencyMin".into(),
+        Value::Integer((audio_latency_samples as i64).into()),
+    );
+    audio_stream_desc.insert(
+        "latencyMax".into(),
+        Value::Integer((audio_latency_samples as i64).into()),
+    );
+    audio_stream_desc.insert(
+        "redundantAudio".into(),
+        Value::Integer(audio_redundant.into()),
+    );
+    if audio_redundant == 0 {
+        audio_stream_desc.insert("disableRetransmits".into(), Value::Boolean(true));
+    }
 
     let mut audio_setup = plist::Dictionary::new();
     audio_setup.insert("deviceID".into(), Value::String(client_device_id.clone()));
@@ -834,10 +914,39 @@ pub fn run_mirror_with_stop(
     audio_setup.insert("osBuildVersion".into(), Value::String("23F79".into()));
     audio_setup.insert("model".into(), Value::String("MacBookPro18,3".into()));
     audio_setup.insert("name".into(), Value::String("MacBook Pro".into()));
-    // FairPlay ekey/eiv (legacy AES path on the receiver). et=32.
-    audio_setup.insert("et".into(), Value::Integer(32i64.into()));
-    audio_setup.insert("ekey".into(), Value::Data(ekey.clone()));
-    audio_setup.insert("eiv".into(), Value::Data(enc_iv.to_vec()));
+
+    // Modern HAP receivers look for shk on the audio stream descriptor; legacy
+    // receivers read the FairPlay ekey/eiv from the root (mirror.go).
+    match (&audio_chacha_key, audio_mode) {
+        (Some(key), AudioSecurityMode::ChaCha) => {
+            audio_stream_desc.insert("shk".into(), Value::Data(key.to_vec()));
+            audio_stream_desc.insert("isMedia".into(), Value::Boolean(true));
+            audio_stream_desc.insert("supportsDynamicStreamID".into(), Value::Boolean(true));
+
+            let mut rtp = plist::Dictionary::new();
+            rtp.insert(
+                "streamConnectionKeyUseStreamEncryptionKey".into(),
+                Value::Boolean(true),
+            );
+            let mut rtcp = plist::Dictionary::new();
+            rtcp.insert(
+                "streamConnectionKeyPort".into(),
+                Value::Integer((audio_control_lport as i64).into()),
+            );
+            let mut connections = plist::Dictionary::new();
+            connections.insert("streamConnectionTypeRTP".into(), Value::Dictionary(rtp));
+            connections.insert("streamConnectionTypeRTCP".into(), Value::Dictionary(rtcp));
+            audio_stream_desc
+                .insert("streamConnections".into(), Value::Dictionary(connections));
+        }
+        _ => {
+            // FairPlay ekey/eiv (legacy AES path on the receiver). et=32.
+            audio_setup.insert("et".into(), Value::Integer(32i64.into()));
+            audio_setup.insert("ekey".into(), Value::Data(ekey.clone()));
+            audio_setup.insert("eiv".into(), Value::Data(enc_iv.to_vec()));
+        }
+    }
+
     audio_setup.insert(
         "streams".into(),
         Value::Array(vec![Value::Dictionary(audio_stream_desc)]),
@@ -855,7 +964,18 @@ pub fn run_mirror_with_stop(
             &[],
         )
         .context("SETUP phase 1 (audio)")?;
-    let _audio_resp_plist = parse_plist(&audio_resp.body).ok();
+    let audio_resp_plist = parse_plist(&audio_resp.body).ok();
+
+    // Parse the audio data + control ports (type=96 stream) from the response.
+    let (audio_data_port, audio_control_port) = audio_resp_plist
+        .as_ref()
+        .and_then(extract_audio_ports)
+        .unwrap_or((0, 0));
+    if audio_data_port > 0 {
+        eprintln!(
+            "[audio] stream: dataPort={audio_data_port} controlPort={audio_control_port}"
+        );
+    }
 
     // ---- Phase 2: video SETUP ----
     let video_stream_connection_id: i64 =
@@ -958,8 +1078,13 @@ pub fn run_mirror_with_stop(
         )
         .context("RECORD")?;
 
-    // ---- SET_PARAMETER volume (max), sent twice like real senders ----
-    let volume_body = b"volume: 0.000000\r\n";
+    // ---- SET_PARAMETER volume, sent twice like real senders. 0 dB is max,
+    // -144 dB mutes (mirror.go SetAudioMuted). --mute selects the muted level. --
+    let volume_body: &[u8] = if opts.mute_audio {
+        b"volume: -144.000000\r\n"
+    } else {
+        b"volume: 0.000000\r\n"
+    };
     let _ = control.lock().unwrap().request(
         "SET_PARAMETER",
         &audio_uri,
@@ -1056,6 +1181,66 @@ pub fn run_mirror_with_stop(
         let _ = ctrlc_set(move || stop.store(true, Ordering::Relaxed));
     }
 
+    // ---- Audio: set up the RTP audio stream + start capture, then run the
+    // StreamAudio loop on its own thread gated on the same first-frame / stop
+    // flags as video (mirror.go: setupAudioStream is created after RECORD and
+    // StreamAudio is launched alongside StreamFrames). ----
+    let mut audio_handle: Option<std::thread::JoinHandle<()>> = None;
+    if !opts.no_audio {
+        if let (Some(ctrl_conn), Some(data_conn)) = (audio_ctrl_conn, audio_data_conn) {
+            if audio_data_port > 0 {
+                let audio_ct = audio::AUDIO_CT_ALAC;
+                match audio::setup_audio_stream(
+                    &host,
+                    audio_data_port,
+                    audio_control_port,
+                    audio_aes_key,
+                    audio_aes_iv,
+                    audio_chacha_key,
+                    audio_mode,
+                    audio_ct,
+                    audio_latency_samples,
+                    ctrl_conn,
+                    data_conn,
+                ) {
+                    Ok(stream) => {
+                        let audio_stream = Arc::new(Mutex::new(stream));
+                        match audio::AudioCapture::start(false) {
+                            Ok(mut capture) => {
+                                eprintln!("[audio] capture started; streaming audio alongside video");
+                                let first_frame = first_frame.clone();
+                                let stop = stop.clone();
+                                let boot = boot_origin();
+                                audio_handle = Some(std::thread::spawn(move || {
+                                    if let Err(e) = audio::stream_audio(
+                                        &mut capture,
+                                        audio_stream,
+                                        &first_frame,
+                                        &stop,
+                                        boot,
+                                    ) {
+                                        eprintln!("[audio] stream ended: {e}");
+                                    }
+                                    capture.stop();
+                                }));
+                            }
+                            Err(e) => {
+                                eprintln!("[audio] capture start failed: {e}; continuing video-only");
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("[audio] stream setup failed: {e}; continuing video-only");
+                    }
+                }
+            } else {
+                eprintln!("[audio] receiver did not provide audio ports; skipping audio");
+            }
+        }
+    } else {
+        eprintln!("[audio] disabled (--no-audio)");
+    }
+
     // ---- Capture + stream (mirror.go StreamFrames) ----
     let capture_cfg = CaptureConfig {
         fps: opts.fps,
@@ -1071,6 +1256,11 @@ pub fn run_mirror_with_stop(
     stop.store(true, Ordering::Relaxed);
     capture.stop();
 
+    // Let the audio thread observe `stop` and wind down its capture/sender.
+    if let Some(h) = audio_handle.take() {
+        let _ = h.join();
+    }
+
     // ---- TEARDOWN ----
     let _ = control
         .lock()
@@ -1078,6 +1268,72 @@ pub fn run_mirror_with_stop(
         .request("TEARDOWN", &audio_uri, "", &[], &[]);
 
     result
+}
+
+/// Bind the audio control + data UDP sockets. Real senders use consecutive
+/// ports (control, data=control+1); we try that first and fall back to two
+/// independent ephemeral ports if the consecutive pair is unavailable.
+fn bind_audio_sockets() -> Result<(std::net::UdpSocket, std::net::UdpSocket)> {
+    use std::net::UdpSocket;
+    // Try to grab a consecutive (N, N+1) pair a few times.
+    for _ in 0..16 {
+        let ctrl = UdpSocket::bind("0.0.0.0:0").context("bind audio control")?;
+        let cport = ctrl.local_addr()?.port();
+        if cport == u16::MAX {
+            continue;
+        }
+        if let Ok(data) = UdpSocket::bind(("0.0.0.0", cport + 1)) {
+            return Ok((ctrl, data));
+        }
+        // Drop `ctrl` and retry.
+    }
+    // Fall back to two independent ephemeral sockets.
+    let ctrl = UdpSocket::bind("0.0.0.0:0").context("bind audio control")?;
+    let data = UdpSocket::bind("0.0.0.0:0").context("bind audio data")?;
+    Ok((ctrl, data))
+}
+
+/// extract_audio_ports — find the type=96 stream's data/control ports in a SETUP
+/// response plist (mirror.go plistStreamPorts: dataPort/controlPort, or the
+/// modern streamConnections RTP/RTCP `streamConnectionKeyPort`).
+fn extract_audio_ports(resp: &plist::Value) -> Option<(u16, u16)> {
+    let dict = resp.as_dictionary()?;
+    let streams = dict.get("streams")?.as_array()?;
+    for s in streams {
+        let sd = match s.as_dictionary() {
+            Some(d) => d,
+            None => continue,
+        };
+        if sd.get("type").and_then(plist_int) != Some(96) {
+            continue;
+        }
+        let mut data_port = sd.get("dataPort").and_then(plist_int).unwrap_or(0);
+        let mut control_port = sd.get("controlPort").and_then(plist_int).unwrap_or(0);
+        if let Some(conns) = sd.get("streamConnections").and_then(|v| v.as_dictionary()) {
+            if let Some(rtp) = conns
+                .get("streamConnectionTypeRTP")
+                .and_then(|v| v.as_dictionary())
+            {
+                if let Some(p) = rtp.get("streamConnectionKeyPort").and_then(plist_int) {
+                    if p > 0 {
+                        data_port = p;
+                    }
+                }
+            }
+            if let Some(rtcp) = conns
+                .get("streamConnectionTypeRTCP")
+                .and_then(|v| v.as_dictionary())
+            {
+                if let Some(p) = rtcp.get("streamConnectionKeyPort").and_then(plist_int) {
+                    if p > 0 {
+                        control_port = p;
+                    }
+                }
+            }
+        }
+        return Some((data_port as u16, control_port as u16));
+    }
+    None
 }
 
 // ---------------------------------------------------------------------------
