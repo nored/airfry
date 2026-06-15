@@ -1,0 +1,14 @@
+# Build output
+/bin/
+*.log
+rust/target/
+target/
+
+# Apple's proprietary FairPlay blob is NEVER committed — it is extracted from
+# the doubletake submodule at build time by rust/fpemu/build.rs.
+rust/fpemu/fp_blob.bin
+
+# Local Arch packaging artifacts
+*.pkg.tar.zst
+/pkg/
+/src/

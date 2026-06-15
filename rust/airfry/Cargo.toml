@@ -1,0 +1,15 @@
+[package]
+name = "airfry"
+version = "0.1.0"
+edition = "2021"
+description = "AirFry — a native Linux AirPlay screen-mirroring sender for Apple TV"
+license = "MIT"
+
+[[bin]]
+name = "airfry"
+path = "src/main.rs"
+
+[dependencies]
+fpemu = { path = "../fpemu" }
+mdns-sd = "0.11"
+anyhow = "1"

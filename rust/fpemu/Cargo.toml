@@ -1,0 +1,14 @@
+[package]
+name = "fpemu"
+version = "0.1.0"
+edition = "2021"
+description = "FairPlay SAP exchange — self-contained ARM64 interpreter, ported from doubletake's Go fpemu."
+
+[dependencies]
+sha1 = "0.10"
+sha2 = "0.10"
+aes = "0.8"
+ctr = "0.9"
+
+[dev-dependencies]
+hex = "0.4"

@@ -1,0 +1,315 @@
+diff --git a/internal/airplay/capture.go b/internal/airplay/capture.go
+index d7d944d..70ea1f3 100644
+--- a/internal/airplay/capture.go
++++ b/internal/airplay/capture.go
+@@ -67,6 +67,7 @@ func startWaylandCapture(ctx context.Context, cfg CaptureConfig) (*ScreenCapture
+ 		return nil, fmt.Errorf("GStreamer 'pipewiresrc' plugin not found; install gst-pipewire")
+ 	}
+ 
++	srcCaptureW, srcCaptureH = 0, 0 // requestScreencast sets these from the portal
+ 	nodeID, pwFd, dbusConn, restoreToken, err := requestScreencast(ctx, cfg.RestoreToken)
+ 	if err != nil {
+ 		return nil, fmt.Errorf("screencast portal: %w", err)
+@@ -77,6 +78,7 @@ func startWaylandCapture(ctx context.Context, cfg CaptureConfig) (*ScreenCapture
+ 		}
+ 	}
+ 	dbg("pipewire node ID: %d", nodeID)
++	applyOutputScale(srcCaptureW, srcCaptureH) // match receiver resolution (Mac-style)
+ 
+ 	captureCtx, cancel := context.WithCancel(ctx)
+ 
+@@ -106,6 +108,7 @@ func startWaylandCapture(ctx context.Context, cfg CaptureConfig) (*ScreenCapture
+ 		"!", fmt.Sprintf("video/x-raw,framerate=%d/1", fps),
+ 		"!", "queue", "max-size-buffers=1", "max-size-bytes=0", "max-size-time=0", "leaky=downstream",
+ 	}
++	gstArgs = append(gstArgs, outputScaleArgs...)
+ 	if encoderParts.needsVulkan {
+ 		gstArgs = append(gstArgs, "!", "vulkanupload")
+ 	}
+@@ -168,13 +171,19 @@ func startX11Capture(ctx context.Context, cfg CaptureConfig) (*ScreenCapture, er
+ 
+ 	display := os.Getenv("DISPLAY")
+ 
+-	encoder := detectGstEncoder(cfg)
+-
+ 	// Detect primary monitor geometry — ximagesrc captures the full X screen
+ 	// (all monitors combined). On multi-monitor setups this wastes CPU on pixels
+ 	// we don't need, so crop to the primary monitor. The encoded resolution is
+-	// then the primary monitor's native resolution (no rescaling).
++	// then the primary monitor's native resolution (no rescaling). Feed the real
++	// size to the auto-bitrate before building the encoder.
+ 	startX, startY, endX, endY := detectPrimaryMonitor(display)
++	if endX > startX && endY > startY {
++		applyOutputScale(endX-startX, endY-startY)
++	} else {
++		applyOutputScale(0, 0)
++	}
++
++	encoder := detectGstEncoder(cfg)
+ 
+ 	ximageSrcArgs := []string{
+ 		"ximagesrc", fmt.Sprintf("display-name=%s", display), "use-damage=false",
+@@ -196,6 +205,7 @@ func startX11Capture(ctx context.Context, cfg CaptureConfig) (*ScreenCapture, er
+ 		"!", "queue", "max-size-buffers=1", "max-size-bytes=0", "max-size-time=0", "leaky=downstream",
+ 		"!", "videoconvert",
+ 	)
++	gstArgs = append(gstArgs, outputScaleArgs...)
+ 	if encoder.needsVulkan {
+ 		gstArgs = append(gstArgs, "!", "vulkanupload")
+ 	}
+@@ -557,6 +567,79 @@ func logStderr(prefix string, r io.Reader) {
+ 	}
+ }
+ 
++// srcCaptureW/H hold the real resolution of the screen being captured, set by
++// the Wayland portal (requestScreencast) or X11 (detectPrimaryMonitor) before
++// the encoder is built. Zero means "unknown" → fall back to a 1080p budget.
++// (Single capture per daemon, so a package-level value is sufficient.)
++var srcCaptureW, srcCaptureH int
++
++// outputScaleArgs holds the GStreamer videoscale segment (or nil) for the
++// current capture, set by applyOutputScale.
++var outputScaleArgs []string
++
++// applyOutputScale rescales the captured srcW x srcH to a target HEIGHT from
++// $DOUBLETAKE_OUTPUT_HEIGHT (preserving aspect ratio). This emulates what a Mac
++// does when it AirPlay-mirrors: send at the receiver's own resolution so the
++// Apple TV renders the stream 1:1 instead of UPSCALING our frame — that upscale
++// is what crops the edges on some Apple TVs. It updates srcCaptureW/H to the
++// ENCODED (target) size so the bitrate and SPS match, and caches the videoscale
++// args for the pipeline.
++func applyOutputScale(srcW, srcH int) {
++	outputScaleArgs = nil
++	if srcW <= 0 || srcH <= 0 {
++		srcCaptureW, srcCaptureH = srcW, srcH
++		return
++	}
++
++	// Encoded frame size: native, or scaled to $DOUBLETAKE_OUTPUT_HEIGHT.
++	tw, th := srcW, srcH
++	if oh, _ := strconv.Atoi(os.Getenv("DOUBLETAKE_OUTPUT_HEIGHT")); oh > 0 {
++		th = oh
++		tw = srcW * oh / srcH
++	}
++	tw -= tw % 2
++	th -= th % 2
++	if tw <= 0 || th <= 0 {
++		srcCaptureW, srcCaptureH = srcW, srcH
++		return
++	}
++	srcCaptureW, srcCaptureH = tw, th
++
++	// $DOUBLETAKE_FIT_PCT > 0: shrink the desktop into the centre by that
++	// percent and pad with black, to counter an Apple TV that zooms the mirror
++	// slightly past the screen edges. The black border gets zoomed off-screen
++	// and the desktop fills exactly — same on-screen result as the Mac without
++	// changing the real desktop resolution.
++	fit, _ := strconv.Atoi(os.Getenv("DOUBLETAKE_FIT_PCT"))
++
++	scaled := tw != srcW || th != srcH
++	if fit <= 0 && !scaled {
++		return // nothing to do — native passthrough
++	}
++	if fit <= 0 {
++		outputScaleArgs = []string{"!", "videoscale", "!", fmt.Sprintf("video/x-raw,width=%d,height=%d", tw, th)}
++		return
++	}
++	if fit > 25 {
++		fit = 25
++	}
++	cw := tw * (100 - fit) / 100
++	ch := th * (100 - fit) / 100
++	cw -= cw % 2
++	ch -= ch % 2
++	bx := (tw - cw) / 2
++	by := (th - ch) / 2
++	outputScaleArgs = []string{
++		"!", "videoscale",
++		"!", fmt.Sprintf("video/x-raw,width=%d,height=%d", cw, ch),
++		"!", "videobox", "fill=black", "autocrop=false",
++		fmt.Sprintf("left=%d", -bx), fmt.Sprintf("right=%d", -bx),
++		fmt.Sprintf("top=%d", -by), fmt.Sprintf("bottom=%d", -by),
++		"!", fmt.Sprintf("video/x-raw,width=%d,height=%d", tw, th),
++	}
++	log.Printf("[CAPTURE] fit %d%%: desktop %dx%d centered in %dx%d frame (border %d/%d)", fit, cw, ch, tw, th, bx, by)
++}
++
+ func captureBitrateKbps(cfg CaptureConfig) int {
+ 	if cfg.Bitrate > 0 {
+ 		return cfg.Bitrate
+@@ -566,16 +649,54 @@ func captureBitrateKbps(cfg CaptureConfig) int {
+ 	if fps <= 0 {
+ 		fps = 30
+ 	}
+-	// The encoded resolution is not known until frames flow (it comes from the
+-	// captured display), so size the auto bitrate for a 1080p budget. Pass
+-	// -bitrate to override for higher-resolution displays.
+-	width, height := 1920, 1080
++	// Size the auto bitrate for the ACTUAL captured resolution (not a hardcoded
++	// 1080p), so 4K/1440p/etc. senders get an appropriate budget. Falls back to
++	// 1080p only when the source size is unknown.
++	width, height := srcCaptureW, srcCaptureH
++	if width <= 0 || height <= 0 {
++		width, height = 1920, 1080
++	}
+ 
+ 	bitrate := recommendedBitrateKbps(width, height, fps)
+ 	log.Printf("[CAPTURE] auto bitrate selected: %d kbps for %dx%d@%dfps", bitrate, width, height, fps)
+ 	return bitrate
+ }
+ 
++// portalStreamSize extracts (width,height) from a portal stream tuple
++// [node_id, properties{size:(ii), ...}]. Returns 0,0 if unavailable.
++func portalStreamSize(tuple []interface{}) (int, int) {
++	if len(tuple) < 2 {
++		return 0, 0
++	}
++	props, ok := tuple[1].(map[string]dbus.Variant)
++	if !ok {
++		return 0, 0
++	}
++	v, ok := props["size"]
++	if !ok {
++		return 0, 0
++	}
++	parts, ok := v.Value().([]interface{})
++	if !ok || len(parts) < 2 {
++		return 0, 0
++	}
++	toInt := func(x interface{}) int {
++		switch n := x.(type) {
++		case int32:
++			return int(n)
++		case uint32:
++			return int(n)
++		case int:
++			return n
++		case int64:
++			return int(n)
++		default:
++			return 0
++		}
++	}
++	return toInt(parts[0]), toInt(parts[1])
++}
++
+ func recommendedBitrateKbps(width, height, fps int) int {
+ 	if width <= 0 || height <= 0 || fps <= 0 {
+ 		return defaultVideoBitrateKbps
+@@ -664,13 +785,13 @@ func requestScreencast(ctx context.Context, restoreToken string) (uint32, *os.Fi
+ 		"multiple":     dbus.MakeVariant(false),
+ 		"cursor_mode":  dbus.MakeVariant(uint32(2)), // EMBEDDED=2 (cursor in stream)
+ 	}
++	// persist_mode 0 = do NOT persist: GNOME's portal prompts for the display on
++	// every share and never silently auto-restores a remembered selection, so
++	// "always choose display" and "Change display" work reliably.
+ 	if portalVersion >= 4 {
+-		selectOpts["persist_mode"] = dbus.MakeVariant(uint32(2))
+-		if restoreToken != "" {
+-			selectOpts["restore_token"] = dbus.MakeVariant(restoreToken)
+-			dbg("[CAPTURE] requesting screencast restore with saved token")
+-		}
++		selectOpts["persist_mode"] = dbus.MakeVariant(uint32(0))
+ 	}
++	_ = restoreToken
+ 
+ 	requestHandle = ""
+ 	call = portal.Call("org.freedesktop.portal.ScreenCast.SelectSources", 0,
+@@ -737,6 +858,7 @@ func requestScreencast(ctx context.Context, restoreToken string) (uint32, *os.Fi
+ 			if tuple, ok3 := v[0].([]interface{}); ok3 && len(tuple) > 0 {
+ 				if nid, ok4 := tuple[0].(uint32); ok4 {
+ 					nodeID = nid
++					srcCaptureW, srcCaptureH = portalStreamSize(tuple)
+ 				} else {
+ 					conn.Close()
+ 					return 0, nil, nil, "", fmt.Errorf("unexpected node ID type: %T", tuple[0])
+@@ -760,6 +882,7 @@ func requestScreencast(ctx context.Context, restoreToken string) (uint32, *os.Fi
+ 			return 0, nil, nil, "", fmt.Errorf("unexpected node ID type: %T", streamList[0][0])
+ 		}
+ 		nodeID = nid
++		srcCaptureW, srcCaptureH = portalStreamSize(streamList[0])
+ 	}
+ 
+ 	// OpenPipeWireRemote returns a Unix fd for the portal's PipeWire remote.
+diff --git a/internal/airplay/mirror.go b/internal/airplay/mirror.go
+index 4582d6f..4057d59 100644
+--- a/internal/airplay/mirror.go
++++ b/internal/airplay/mirror.go
+@@ -11,6 +11,7 @@ import (
+ 	"log"
+ 	"math"
+ 	"net"
++	"os"
+ 	"strconv"
+ 	"strings"
+ 	"sync"
+@@ -60,6 +61,34 @@ func (c *AirPlayClient) setupMirrorSession(ctx context.Context, cfg StreamConfig
+ 	sessionUUID := generateUUID()
+ 	clientDeviceID := uuidToMAC(c.sessionID)
+ 
++	// Authenticated probe (set DOUBLETAKE_PROBE_INFO=1): query /info and
++	// /server-info as a trusted, post-pair-verify sender to see what geometry,
++	// if any, the receiver hands a paired sender.
++	if os.Getenv("DOUBLETAKE_PROBE_INFO") != "" {
++		for _, p := range []string{"/info", "/server-info"} {
++			body, err := c.httpRequest("GET", p, "application/x-apple-binary-plist", nil)
++			if err != nil {
++				log.Printf("[AUTH-INFO] GET %s failed: %v", p, err)
++				continue
++			}
++			var m map[string]interface{}
++			if _, e := plist.Unmarshal(body, &m); e == nil {
++				keys := make([]string, 0, len(m))
++				for k := range m {
++					keys = append(keys, k)
++				}
++				log.Printf("[AUTH-INFO] %s (%d bytes) keys: %v", p, len(body), keys)
++				for _, k := range []string{"displays", "width", "height", "widthPixels", "heightPixels", "overscanned", "screenSize"} {
++					if v, ok := m[k]; ok {
++						log.Printf("[AUTH-INFO]   %s/%s = %+v", p, k, v)
++					}
++				}
++			} else {
++				log.Printf("[AUTH-INFO] %s (%d bytes) not a plist; raw: %.200x", p, len(body), body)
++			}
++		}
++	}
++
+ 	// Determine stream encryption key
+ 	encKey := c.fpKey
+ 	encIV := c.fpIV
+@@ -219,12 +248,12 @@ func (c *AirPlayClient) setupMirrorSession(ctx context.Context, cfg StreamConfig
+ 		"deviceID":       clientDeviceID,
+ 		"macAddress":     clientDeviceID,
+ 		"sessionUUID":    sessionUUID,
+-		"sourceVersion":  "280.33",
++		"sourceVersion":  "935.7.1",
+ 		"timingProtocol": "NTP",
+ 		"timingPort":     int64(timingPort),
+-		"osBuildVersion": "13F69",
+-		"model":          "Linux",
+-		"name":           "Linux",
++		"osBuildVersion": "23F79",
++		"model":          "MacBookPro18,3",
++		"name":           "MacBook Pro",
+ 		"streams":        []interface{}{audioStreamDesc},
+ 	}
+ 
+@@ -359,13 +388,13 @@ func (c *AirPlayClient) setupMirrorSession(ctx context.Context, cfg StreamConfig
+ 		"deviceID":                 clientDeviceID,
+ 		"macAddress":               clientDeviceID,
+ 		"sessionUUID":              sessionUUID,
+-		"sourceVersion":            "280.33",
++		"sourceVersion":            "935.7.1",
+ 		"isScreenMirroringSession": true,
+ 		"timingProtocol":           "NTP",
+ 		"timingPort":               int64(timingPort),
+-		"osBuildVersion":           "13F69",
+-		"model":                    "Linux",
+-		"name":                     "Linux",
++		"osBuildVersion":           "23F79",
++		"model":                    "MacBookPro18,3",
++		"name":                     "MacBook Pro",
+ 		"streams":                  []interface{}{videoStreamDesc},
+ 	}
+ 	// UxPlay reads ekey/eiv from the root level of the SETUP request to derive
