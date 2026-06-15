@@ -119,34 +119,17 @@ pub fn use_audio_fec(modern_encrypted: bool) -> bool {
 // the caller passes here.
 // ---------------------------------------------------------------------------
 
-/// latency.go defaultTargetLatency = 1ms → at least 1 sample at 44.1 kHz.
-fn default_target_latency() -> Duration {
-    Duration::from_millis(1)
-}
+// The 44.1 kHz sample math (samplesFor44k1 / targetLatencySamples44k1) lives in
+// the centralized `latency` module — the single source of truth for the
+// sender's playout-latency target. audio.rs delegates to it below.
 
-/// latency.go samplesFor44k1: round(d * 44100), floored at 1.
-pub fn samples_for_44k1(d: Duration) -> u32 {
-    let samples = (d.as_secs_f64() * 44100.0).round();
-    if samples < 1.0 {
-        1
-    } else if samples > u32::MAX as f64 {
-        u32::MAX
-    } else {
-        samples as u32
-    }
-}
-
-/// audio.go targetLatencySamples44k1 (default target latency).
-fn target_latency_samples_44k1() -> u32 {
-    samples_for_44k1(default_target_latency())
-}
-
-/// audio.go audioLatencySamplesForCodec: the override wins when > 0.
+/// audio.go audioLatencySamplesForCodec: the override wins when > 0; otherwise
+/// the process-global target latency in 44.1 kHz samples (latency.rs).
 pub fn audio_latency_samples_for_codec(_ct: u8, override_samples: u32) -> u32 {
     if override_samples > 0 {
         override_samples
     } else {
-        target_latency_samples_44k1()
+        crate::latency::target_latency_samples_44k1()
     }
 }
 

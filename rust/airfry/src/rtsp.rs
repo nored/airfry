@@ -17,6 +17,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use chacha20poly1305::aead::{Aead, KeyInit, Payload};
 use chacha20poly1305::ChaCha20Poly1305;
 
+use crate::credentials::CredentialStore;
 use crate::discovery::AirPlayDevice;
 use crate::fairplay::{self, FairPlayKeys};
 use crate::info::{self, ReceiverInfo};
@@ -413,7 +414,21 @@ impl Session {
         // so the raw pair-verify can verify the server signature even before
         // /info is parsed. Decoded from hex; ignored if malformed.
         let mds_pk = decode_hex(&device.pk);
-        Self::connect_host_full(&device.ip, device.port, "", &mds_pk, &mut |_, _, _| {})
+        // Key the credential store by the receiver's stable device id when known,
+        // falling back to its IP otherwise.
+        let device_key = if device.device_id.is_empty() {
+            device.ip.clone()
+        } else {
+            device.device_id.clone()
+        };
+        Self::connect_host_full(
+            &device.ip,
+            device.port,
+            "",
+            &mds_pk,
+            &device_key,
+            &mut |_, _, _| {},
+        )
     }
 
     /// Like `connect`, but takes an explicit host/port and optional PIN.
@@ -429,7 +444,8 @@ impl Session {
         pin: &str,
         progress: &mut dyn FnMut(&str, bool, &str),
     ) -> Result<Session> {
-        Self::connect_host_full(host, port, pin, &[], progress)
+        // Key the credential store by host when no stable device id is known.
+        Self::connect_host_full(host, port, pin, &[], host, progress)
     }
 
     /// Full handshake, with an optional caller-supplied receiver ed25519 PK
@@ -440,9 +456,26 @@ impl Session {
         port: u16,
         pin: &str,
         mdns_pk: &[u8],
+        device_id: &str,
         progress: &mut dyn FnMut(&str, bool, &str),
     ) -> Result<Session> {
-        let pairing_id = pairing::generate_uuid();
+        // Open the persistent credential store (non-fatal on any IO error) and
+        // reuse a previously-saved pairing identity for this device when present.
+        // Reusing the ed25519 identity lets the receiver recognise this sender as
+        // a known controller across runs.
+        let mut cred_store = CredentialStore::open_default();
+        let saved = cred_store.lookup(device_id);
+        let pairing_id = match &saved {
+            Some(c) if c.has_pairing_credentials() => c.pairing_id.clone(),
+            _ => pairing::generate_uuid(),
+        };
+        let reuse_seed: Option<[u8; 32]> = saved.as_ref().and_then(|c| {
+            if c.has_pairing_credentials() {
+                c.ed25519_keys().map(|(_pub, seed)| seed)
+            } else {
+                None
+            }
+        });
         let session_id = pairing::generate_uuid();
 
         let mut transport = match Transport::connect(host, port) {
@@ -520,17 +553,37 @@ impl Session {
         }
 
         if !raw_path {
-            // TLV8 transient (or PIN) pair-setup.
-            pair_keys = match pairing::pair_setup(&mut transport, &pairing_id, pin) {
-                Ok(k) => {
-                    progress("pair-setup", true, "SRP exchange complete");
-                    k
+            // TLV8 transient (or PIN) pair-setup, reusing the saved ed25519
+            // identity when one is available.
+            pair_keys =
+                match pairing::pair_setup_with_identity(&mut transport, &pairing_id, pin, reuse_seed)
+                {
+                    Ok(k) => {
+                        progress("pair-setup", true, "SRP exchange complete");
+                        k
+                    }
+                    Err(e) => {
+                        progress("pair-setup", false, &e.to_string());
+                        return Err(e.context("pair-setup"));
+                    }
+                };
+
+            // A non-empty PIN is a FULL pairing: persist the long-term identity so
+            // future connections to this device can reuse it (transient PIN-less
+            // pairing is ephemeral and is NOT saved, matching doubletake's store
+            // which is only fed by the full pairing path).
+            if !pin.is_empty() {
+                match cred_store.save(
+                    device_id,
+                    &pairing_id,
+                    &pair_keys.ed25519_public,
+                    &pair_keys.ed25519_seed,
+                ) {
+                    Ok(()) => progress("credentials", true, "saved pairing identity"),
+                    // Persisting is best-effort; an IO error must not fail pairing.
+                    Err(e) => progress("credentials", false, &e.to_string()),
                 }
-                Err(e) => {
-                    progress("pair-setup", false, &e.to_string());
-                    return Err(e.context("pair-setup"));
-                }
-            };
+            }
 
             // HAP pair-verify (X25519); enables HAP encryption on the transport.
             match pairing::pair_verify(&mut transport, &pairing_id, &mut pair_keys) {

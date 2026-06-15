@@ -40,6 +40,10 @@ gstreamer-video = "0.23"
 # binary plists for the mirror SETUP bodies
 plist = "1"
 
+# persistent pairing credential store (JSON file backend)
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
 # XDG ScreenCast portal (Wayland) + a tiny runtime to drive its async API
 ashpd = { version = "0.9", default-features = false, features = ["tokio"] }
 tokio = { version = "1", features = ["rt", "macros"] }

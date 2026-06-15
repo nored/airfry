@@ -129,9 +129,27 @@ fn pair_headers() -> &'static [(&'static str, &'static str)] {
 /// Generates a fresh ed25519 identity and returns the resulting `PairKeys`
 /// (without the X25519 shared secret, which pair-verify fills in).
 pub fn pair_setup(transport: &mut Transport, pairing_id: &str, pin: &str) -> Result<PairKeys> {
-    // Generate ed25519 identity for this session.
-    let mut seed = [0u8; 32];
-    rand::thread_rng().fill_bytes(&mut seed);
+    pair_setup_with_identity(transport, pairing_id, pin, None)
+}
+
+/// Like `pair_setup`, but reuses a previously-saved ed25519 identity (32-byte
+/// seed) when provided, so a receiver recognises this sender as a known
+/// controller. A `None` seed generates a fresh identity.
+pub fn pair_setup_with_identity(
+    transport: &mut Transport,
+    pairing_id: &str,
+    pin: &str,
+    reuse_seed: Option<[u8; 32]>,
+) -> Result<PairKeys> {
+    // Reuse the saved ed25519 identity when supplied; otherwise generate one.
+    let seed = match reuse_seed {
+        Some(s) => s,
+        None => {
+            let mut s = [0u8; 32];
+            rand::thread_rng().fill_bytes(&mut s);
+            s
+        }
+    };
     let signing = SigningKey::from_bytes(&seed);
     let mut keys = PairKeys {
         ed25519_public: signing.verifying_key().to_bytes().to_vec(),

@@ -45,6 +45,7 @@ use sha2::{Digest, Sha512};
 
 use crate::audio::{self, AudioSecurityMode};
 use crate::capture::{CaptureConfig, CaptureSource};
+use crate::latency;
 use crate::rtsp::{Session, Transport};
 
 type Aes128Ctr = ctr::Ctr128BE<aes::Aes128>;
@@ -88,10 +89,11 @@ fn boot_origin() -> Instant {
 
 const SECONDS_FROM_1900_TO_1970: u64 = 2208988800;
 
-/// videoTimestampBias — TargetLatency, floored at 5ms. mirror.go uses a 1ms
-/// default target latency which then gets floored to 5ms here.
+/// videoTimestampBias — TargetLatency, floored at 5ms. Centralized in
+/// latency.rs (the single source of truth); with the default 1ms target this
+/// still yields 5ms, unchanged.
 fn video_timestamp_bias() -> Duration {
-    Duration::from_millis(5)
+    latency::video_timestamp_bias()
 }
 
 /// ntpTimeWithBias — 64-bit NTP fixed-point, boot-relative, no epoch, with bias.
@@ -869,7 +871,10 @@ pub fn run_mirror_with_stop(
     } else {
         0
     };
-    let audio_latency_samples = audio::samples_for_44k1(Duration::from_millis(5));
+    // sessionLatency = TargetLatency() in 44.1 kHz samples (mirror.go
+    // samplesFor44k1(sessionLatency)). Centralized in latency.rs; with the
+    // default 1ms target this is round(44.1) = 44 samples.
+    let audio_latency_samples = latency::target_latency_samples_44k1();
 
     let mut audio_stream_desc = plist::Dictionary::new();
     audio_stream_desc.insert("type".into(), Value::Integer(96i64.into()));

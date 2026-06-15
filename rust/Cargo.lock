@@ -48,6 +48,8 @@ dependencies = [
  "plist",
  "poly1305",
  "rand",
+ "serde",
+ "serde_json",
  "sha2",
  "tokio",
  "x25519-dalek",

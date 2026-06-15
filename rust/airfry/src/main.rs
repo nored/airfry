@@ -6,10 +6,13 @@
 //! (research-only submodule; see third_party/doubletake) — credit: omarroth.
 
 mod audio;
+mod broadcast;
 mod capture;
+mod credentials;
 mod discovery;
 mod fairplay;
 mod info;
+mod latency;
 mod mirror;
 mod pairing;
 mod playfair;
