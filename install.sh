@@ -2,66 +2,42 @@
 # AirFry one-line installer for Arch Linux.
 #   curl -fsSL https://raw.githubusercontent.com/nored/airfry/master/install.sh | bash
 #
-# Installs the build toolchain, clones the repo with submodules, builds airfry,
-# and installs it to ~/.local/bin/airfry. Apple's FairPlay blob is NOT shipped;
-# it is extracted from the doubletake submodule at build time.
+# Builds a proper pacman package and installs it system-wide (airfry lands in
+# /usr/bin, which is on PATH, and is tracked by pacman so `pacman -R airfry`
+# removes it cleanly). Apple's FairPlay blob is NOT shipped; it is extracted
+# from the doubletake submodule at build time.
 set -euo pipefail
 
 REPO_URL="${AIRFRY_REPO:-https://github.com/nored/airfry.git}"
-SRC_DIR="${AIRFRY_SRC:-$HOME/.local/share/airfry/src}"
-BIN_DIR="${AIRFRY_BIN:-$HOME/.local/bin}"
+BUILD_DIR="${AIRFRY_BUILD:-${XDG_CACHE_HOME:-$HOME/.cache}/airfry/build}"
 
 say()  { printf '\033[1;36m==>\033[0m %s\n' "$*"; }
 warn() { printf '\033[1;33m warn:\033[0m %s\n' "$*" >&2; }
 die()  { printf '\033[1;31merror:\033[0m %s\n' "$*" >&2; exit 1; }
 
 command -v pacman >/dev/null 2>&1 || die "this installer targets Arch Linux (pacman not found)."
+[ "$(id -u)" -ne 0 ] || die "run as a normal user, not root (makepkg refuses root; it will sudo when needed)."
 
-# --- 1. dependencies ------------------------------------------------------
-# Build toolchain + git. (Capture/encode runtime deps are added as the mirror
-# pipeline lands — pipewire, gstreamer, libva, intel-media-driver.)
-DEPS=(git rust)
-MISSING=()
-for p in "${DEPS[@]}"; do
-  pacman -Qq "$p" >/dev/null 2>&1 || MISSING+=("$p")
-done
-# `rust` may be provided by rustup instead of the pacman package.
-if printf '%s\n' "${MISSING[@]:-}" | grep -qx rust && command -v cargo >/dev/null 2>&1; then
-  MISSING=("${MISSING[@]/rust}")
-fi
-MISSING=("${MISSING[@]/#/}"); MISSING=($(printf '%s\n' "${MISSING[@]}" | sed '/^$/d')) || true
-if [ "${#MISSING[@]}" -gt 0 ]; then
-  say "Installing dependencies: ${MISSING[*]}"
-  sudo pacman -S --needed --noconfirm "${MISSING[@]}"
-else
-  say "Build dependencies already present."
-fi
-command -v cargo >/dev/null 2>&1 || { [ -f "$HOME/.cargo/env" ] && . "$HOME/.cargo/env"; }
-command -v cargo >/dev/null 2>&1 || die "cargo not on PATH after install."
+# --- 1. build dependencies ------------------------------------------------
+# base-devel: makepkg. rust: cargo. git: clone + submodules.
+say "Installing build dependencies (base-devel, rust, git)…"
+sudo pacman -S --needed --noconfirm base-devel rust git
 
 # --- 2. fetch -------------------------------------------------------------
-if [ -d "$SRC_DIR/.git" ]; then
-  say "Updating existing checkout in $SRC_DIR"
-  git -C "$SRC_DIR" pull --ff-only
-  git -C "$SRC_DIR" submodule update --init --recursive
+if [ -d "$BUILD_DIR/.git" ]; then
+  say "Updating checkout in $BUILD_DIR"
+  git -C "$BUILD_DIR" pull --ff-only
+  git -C "$BUILD_DIR" submodule update --init --recursive
 else
-  say "Cloning $REPO_URL -> $SRC_DIR"
-  mkdir -p "$(dirname "$SRC_DIR")"
-  git clone --recurse-submodules "$REPO_URL" "$SRC_DIR"
+  say "Cloning $REPO_URL -> $BUILD_DIR"
+  rm -rf "$BUILD_DIR"
+  mkdir -p "$(dirname "$BUILD_DIR")"
+  git clone --recurse-submodules "$REPO_URL" "$BUILD_DIR"
 fi
 
-# --- 3. build -------------------------------------------------------------
-say "Building airfry (release)…"
-( cd "$SRC_DIR/rust" && cargo build --release -p airfry )
+# --- 3. build + install the package --------------------------------------
+say "Building and installing the airfry package (makepkg -si)…"
+( cd "$BUILD_DIR" && makepkg -si --needed --noconfirm )
 
-# --- 4. install -----------------------------------------------------------
-mkdir -p "$BIN_DIR"
-install -m755 "$SRC_DIR/rust/target/release/airfry" "$BIN_DIR/airfry"
-say "Installed: $BIN_DIR/airfry"
-
-case ":$PATH:" in
-  *":$BIN_DIR:"*) ;;
-  *) warn "$BIN_DIR is not on your PATH. Add:  export PATH=\"$BIN_DIR:\$PATH\"" ;;
-esac
-
+say "Installed: $(command -v airfry || echo /usr/bin/airfry)"
 say "Done. Try:  airfry discover"
