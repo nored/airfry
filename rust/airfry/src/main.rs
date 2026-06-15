@@ -24,6 +24,9 @@ use std::time::Duration;
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
+    // doubletake's -target-latency-ms defaults to 100ms (main.go:59); its
+    // latency.init sets only 1ms, so the effective default is 100ms. Match it.
+    latency::set_target_latency(Duration::from_millis(100));
     // The tray widget is the default face of the app: with no subcommand we
     // launch it. Explicit subcommands keep working for headless/CLI use.
     let cmd = args.get(1).map(String::as_str).unwrap_or("tray");
