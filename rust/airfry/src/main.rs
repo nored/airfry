@@ -13,19 +13,27 @@ mod pairing;
 mod playfair;
 mod rtsp;
 mod tlv8;
+mod tray;
 
 use std::time::Duration;
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
-    let cmd = args.get(1).map(String::as_str).unwrap_or("help");
+    // The tray widget is the default face of the app: with no subcommand we
+    // launch it. Explicit subcommands keep working for headless/CLI use.
+    let cmd = args.get(1).map(String::as_str).unwrap_or("tray");
 
     let code = match cmd {
+        "tray" => tray::run_tray(),
         "discover" | "scan" => cmd_discover(),
         "pair" => cmd_pair(&args),
         "mirror" => cmd_mirror(&args),
         "version" | "--version" | "-V" => {
             println!("airfry {}", env!("CARGO_PKG_VERSION"));
+            0
+        }
+        "help" | "--help" | "-h" => {
+            print_help();
             0
         }
         _ => {

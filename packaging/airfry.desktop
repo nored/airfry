@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=AirFry
+Comment=Mirror your screen to an Apple TV (AirPlay)
+Exec=airfry
+Icon=video-display
+Terminal=false
+Categories=AudioVideo;Video;Network;
+Keywords=airplay;mirror;screen;appletv;cast;

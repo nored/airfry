@@ -40,3 +40,6 @@ tokio = { version = "1", features = ["rt", "macros"] }
 
 # clean Ctrl-C handling for the mirror run loop
 ctrlc = "3"
+
+[build-dependencies]
+cc = "1"

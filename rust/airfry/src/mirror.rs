@@ -747,7 +747,17 @@ fn uuid_to_mac(id: &str) -> String {
 /// Run a screen-mirroring session against an established `Session`, until the
 /// capture stream ends or Ctrl-C is pressed. Faithful to mirror.go's
 /// setupMirrorSession + StreamFrames (video only).
-pub fn run_mirror(mut session: Session, opts: MirrorOpts) -> Result<()> {
+pub fn run_mirror(session: Session, opts: MirrorOpts) -> Result<()> {
+    run_mirror_with_stop(session, opts, Arc::new(AtomicBool::new(false)))
+}
+
+/// Like `run_mirror`, but driven by a caller-owned stop flag so an external
+/// controller (e.g. the tray) can stop or switch the mirror at any time.
+pub fn run_mirror_with_stop(
+    mut session: Session,
+    opts: MirrorOpts,
+    stop: Arc<AtomicBool>,
+) -> Result<()> {
     use plist::Value;
 
     // The mirror RTSP request line uses the full rtsp:// URI as the path. We
@@ -769,7 +779,6 @@ pub fn run_mirror(mut session: Session, opts: MirrorOpts) -> Result<()> {
     // ---- NTP timing responder: bind a UDP socket and answer probes ----
     let timing_sock = std::net::UdpSocket::bind("0.0.0.0:0").context("bind timing UDP")?;
     let timing_port = timing_sock.local_addr()?.port();
-    let stop = Arc::new(AtomicBool::new(false));
     {
         let stop = stop.clone();
         std::thread::spawn(move || ntp_timing_responder(timing_sock, stop));
