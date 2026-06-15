@@ -48,12 +48,18 @@ plist = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
+# system keyring credential backend (-cred-backend keyring): on Linux this uses
+# the freedesktop Secret Service (GNOME Keyring, KDE Wallet, KeePassXC, ...),
+# matching doubletake's go-keyring backend. crypto-rust keeps the encryption in
+# pure Rust so we don't need a system libdbus/OpenSSL at build time.
+keyring = { version = "3", features = ["sync-secret-service", "crypto-rust"] }
+
 # XDG ScreenCast portal (Wayland) + a tiny runtime to drive its async API
 ashpd = { version = "0.9", default-features = false, features = ["tokio"] }
 tokio = { version = "1", features = ["rt", "macros"] }
 
-# clean Ctrl-C handling for the mirror run loop
-ctrlc = "3"
+# clean Ctrl-C / SIGTERM handling for the mirror run loop + graceful shutdown
+ctrlc = { version = "3", features = ["termination"] }
 
 [build-dependencies]
 cc = "1"

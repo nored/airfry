@@ -407,6 +407,85 @@ mod tests {
         }
     }
 
+    /// `BroadcastSink` must be usable as a `mirror::FrameSource` so the daemon
+    /// can hand one shared capture's sink to a mirror in place of a CaptureSource.
+    /// Drives a real BroadcastSink through `&mut dyn FrameSource` end to end.
+    #[test]
+    fn broadcast_sink_is_a_frame_source() {
+        use crate::mirror::FrameSource;
+
+        let (src, feed) = MemSource::new();
+        let bc = Arc::new(MemBroadcast::new(src));
+        let sink = bc.add_sink();
+
+        std::thread::spawn(move || {
+            feed.send(b"frame-source bytes".to_vec()).unwrap();
+            feed.send(Vec::new()).unwrap(); // EOF
+        });
+
+        let bc_run = bc.clone();
+        let pump = std::thread::spawn(move || bc_run.run());
+
+        // Consume the sink purely through the trait object.
+        let mut fs: Box<dyn FrameSource> = Box::new(sink);
+        let mut out = Vec::new();
+        let mut buf = [0u8; 5];
+        loop {
+            let n = fs.read(&mut buf).unwrap();
+            if n == 0 {
+                break;
+            }
+            out.extend_from_slice(&buf[..n]);
+        }
+        pump.join().unwrap();
+        assert_eq!(out, b"frame-source bytes");
+    }
+
+    /// 1-source → 2-mirror wiring smoke test: one BroadcastCapture fans to two
+    /// `BroadcastSink`s, each consumed as an independent `Box<dyn FrameSource>`
+    /// (as the daemon hands them to two `run_mirror_with_source` calls). Both
+    /// trait objects must observe the identical full byte stream, then EOF.
+    #[test]
+    fn one_source_to_two_frame_source_mirrors() {
+        use crate::mirror::FrameSource;
+
+        let (src, feed) = MemSource::new();
+        let bc = Arc::new(MemBroadcast::new(src));
+        let s1: Box<dyn FrameSource> = Box::new(bc.add_sink());
+        let s2: Box<dyn FrameSource> = Box::new(bc.add_sink());
+
+        std::thread::spawn(move || {
+            feed.send(b"00 00 00 01 ".to_vec()).unwrap();
+            feed.send(b"SPS PPS IDR".to_vec()).unwrap();
+            feed.send(Vec::new()).unwrap(); // EOF
+        });
+
+        let bc_run = bc.clone();
+        let pump = std::thread::spawn(move || bc_run.run());
+
+        fn drain_fs(mut fs: Box<dyn FrameSource>) -> Vec<u8> {
+            let mut out = Vec::new();
+            let mut buf = [0u8; 4];
+            loop {
+                let n = fs.read(&mut buf).unwrap();
+                if n == 0 {
+                    break;
+                }
+                out.extend_from_slice(&buf[..n]);
+            }
+            out
+        }
+
+        let h1 = std::thread::spawn(move || drain_fs(s1));
+        let h2 = std::thread::spawn(move || drain_fs(s2));
+        let got1 = h1.join().unwrap();
+        let got2 = h2.join().unwrap();
+        pump.join().unwrap();
+
+        assert_eq!(got1, b"00 00 00 01 SPS PPS IDR");
+        assert_eq!(got2, b"00 00 00 01 SPS PPS IDR");
+    }
+
     /// One source fans out to two sinks: both sinks must receive the identical
     /// full byte stream, then EOF.
     #[test]

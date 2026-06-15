@@ -44,6 +44,7 @@ check() {
 package() {
   cd "$startdir"
   install -Dm755 rust/target/release/airfry "$pkgdir/usr/bin/airfry"
+  install -Dm755 rust/target/release/airfry-ctl "$pkgdir/usr/bin/airfry-ctl"
   install -Dm644 README.md "$pkgdir/usr/share/doc/$pkgname/README.md"
   install -Dm644 packaging/airfry.desktop "$pkgdir/usr/share/applications/airfry.desktop" 2>/dev/null || true
 }

@@ -238,7 +238,14 @@ fn start_mirror(addr: &str) {
         // code. For now the tray attempts PIN-less pairing only.
         let mut ask_pin = || None;
         let session =
-            match rtsp::Session::connect_host_with(&host, port, "", &mut ask_pin, &mut report) {
+            match rtsp::Session::connect_host_with(
+                &host,
+                port,
+                "",
+                &rtsp::ConnectOptions::default(),
+                &mut ask_pin,
+                &mut report,
+            ) {
             Ok(s) => s,
             Err(e) => {
                 set_status(&format!("Connect failed: {e}"));

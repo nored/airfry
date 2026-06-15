@@ -561,6 +561,67 @@ impl CaptureSource {
     pub fn stop(&self) {
         let _ = self.pipeline.set_state(gst::State::Null);
     }
+
+    /// A detached, cloneable stop handle for this capture's GStreamer pipeline.
+    ///
+    /// `stop()` itself takes `&self`, which is only reachable while you hold the
+    /// `CaptureSource`. Once the source is moved into a `BroadcastCapture` (whose
+    /// pump thread holds it behind a `Mutex` for its whole life, blocking inside
+    /// the source's `read`), there is no longer any way to call `stop()` — the
+    /// only accessor, `BroadcastCapture::source()`, would deadlock on that lock.
+    ///
+    /// This returns a `CaptureStopHandle` wrapping a clone of the underlying
+    /// `gst::Pipeline` (a refcounted GObject handle). Setting its state to Null
+    /// does NOT touch the `CaptureSource`'s Rust mutex, so it can be called from
+    /// another thread while the pump is blocked in `read`: it tears the pipeline
+    /// down, the appsink channel closes, and the pump's `read` returns 0 (EOS),
+    /// letting `BroadcastCapture::run` finish. The daemon grabs one of these
+    /// before handing the capture to `BroadcastCapture::new`, so it can implement
+    /// `maybeStopBroadcastLocked` (daemon.go) — stop the shared capture when the
+    /// last stream ends.
+    pub fn stop_handle(&self) -> CaptureStopHandle {
+        CaptureStopHandle {
+            pipeline: self.pipeline.clone(),
+        }
+    }
+}
+
+/// A detached stop control for a `CaptureSource`'s pipeline — see
+/// `CaptureSource::stop_handle`. Cloneable and `Send`; safe to call from any
+/// thread, including while a `BroadcastCapture` pump is reading the source.
+#[derive(Clone)]
+pub struct CaptureStopHandle {
+    pipeline: gst::Pipeline,
+}
+
+impl CaptureStopHandle {
+    /// Stop the underlying pipeline, without taking any Rust lock the pump might
+    /// hold. Idempotent.
+    ///
+    /// A bare `set_state(Null)` is not enough to wake a consumer blocked in the
+    /// source's `read`: it waits on an mpsc whose sender lives inside the
+    /// appsink's `new_sample` callback, and Null alone neither delivers more
+    /// samples nor drops that callback, so `recv` would block forever.
+    ///
+    /// To guarantee the consumer wakes, we locate the `AppSink` in the pipeline
+    /// and replace its callbacks with empty ones. That drops the previous
+    /// closures — and with them the mpsc `Sender` — so the blocked `recv`
+    /// immediately returns `Err`, the source's `read` reports end-of-stream (0),
+    /// and the `BroadcastCapture` pump exits. We then set the pipeline to Null to
+    /// release the screen-capture / portal resources.
+    pub fn stop(&self) {
+        if let Some(bin) = self.pipeline.dynamic_cast_ref::<gst::Bin>() {
+            // Iterate the pipeline's elements and clear the appsink's callbacks
+            // (dropping its mpsc Sender so any blocked `read` unblocks).
+            let mut it = bin.iterate_elements();
+            while let Ok(Some(el)) = it.next() {
+                if let Some(appsink) = el.dynamic_cast_ref::<gst_app::AppSink>() {
+                    appsink.set_callbacks(gst_app::AppSinkCallbacks::builder().build());
+                }
+            }
+        }
+        let _ = self.pipeline.set_state(gst::State::Null);
+    }
 }
 
 impl Drop for CaptureSource {

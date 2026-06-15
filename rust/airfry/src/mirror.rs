@@ -44,11 +44,40 @@ use hkdf::Hkdf;
 use sha2::{Digest, Sha512};
 
 use crate::audio::{self, AudioSecurityMode};
+use crate::broadcast::BroadcastSink;
 use crate::capture::{CaptureConfig, CaptureSource};
 use crate::latency;
 use crate::rtsp::{Session, Transport};
 
 type Aes128Ctr = ctr::Ctr128BE<aes::Aes128>;
+
+/// A source of the raw Annex-B / AVCC H.264 byte stream the mirror consumes.
+///
+/// Abstracts over an owned `capture::CaptureSource` (one mirror, one capture)
+/// and a `broadcast::BroadcastSink` (one shared `BroadcastCapture` fanned out to
+/// N mirrors — the daemon's multi-receiver case). Both already expose a
+/// `read(&mut [u8]) -> Result<usize>` with the same contract (fills `buf`,
+/// returns the byte count, 0 == end-of-stream), so the NAL parser / AU-assembly
+/// loop reads from `dyn FrameSource` and is agnostic to which one it is. This is
+/// the Rust analogue of Go's `*ScreenCapture` interface that both
+/// `ScreenCapture` and `BroadcastSink.AsCapture()` satisfy (daemon.go:691).
+pub trait FrameSource: Send {
+    /// Fill `buf` with the next chunk of the H.264 byte-stream. Returns the
+    /// number of bytes written, or 0 at end-of-stream.
+    fn read(&mut self, buf: &mut [u8]) -> Result<usize>;
+}
+
+impl FrameSource for CaptureSource {
+    fn read(&mut self, buf: &mut [u8]) -> Result<usize> {
+        CaptureSource::read(self, buf)
+    }
+}
+
+impl FrameSource for BroadcastSink {
+    fn read(&mut self, buf: &mut [u8]) -> Result<usize> {
+        BroadcastSink::read(self, buf)
+    }
+}
 
 /// Options for a mirror run.
 #[derive(Clone, Debug)]
@@ -932,10 +961,29 @@ pub fn run_mirror_with_stop(
 /// Like `run_mirror_with_stop`, but additionally accepts a `MirrorControl` so
 /// the daemon/tray can mute/unmute the audio while the mirror is running
 /// (mirror.go SetAudioMuted). The control's stop flag drives shutdown.
+///
+/// Builds its own `CaptureSource`; for the daemon's shared-capture fan-out use
+/// `run_mirror_with_source` instead.
 pub fn run_mirror_with_control(
     session: Session,
     opts: MirrorOpts,
     control_handle: MirrorControl,
+) -> Result<()> {
+    run_mirror_with_source(session, opts, control_handle, None)
+}
+
+/// The full mirror driver. When `source` is `Some`, the mirror consumes its
+/// H.264 byte stream from that `FrameSource` (e.g. a `broadcast::BroadcastSink`
+/// fanned off a single shared `BroadcastCapture`) INSTEAD of building its own
+/// `CaptureSource`. This lets the daemon drive N receivers from ONE screen
+/// capture (daemon.go getOrStartBroadcastLocked → `StreamFrames(sink.AsCapture())`).
+/// When `source` is `None`, it builds and owns its own capture, exactly like
+/// `run_mirror_with_control`.
+pub fn run_mirror_with_source(
+    session: Session,
+    opts: MirrorOpts,
+    control_handle: MirrorControl,
+    source: Option<Box<dyn FrameSource>>,
 ) -> Result<()> {
     use plist::Value;
 
@@ -974,6 +1022,9 @@ pub fn run_mirror_with_control(
     // transport behind an Arc<Mutex> so the keepalive threads can share it.
     let ekey = session.ekey.clone();
     let pair_shared_secret = session.pair_keys.shared_secret.clone();
+    // Raw FairPlay AES key — the ChaCha DataStream IKM fallback when no
+    // pair-verify shared secret is present (mirror.go:547-558 `c.fpAesKey`).
+    let fp_aes_key = session.fp_aes_key.clone();
     // Whether the control channel is HAP-encrypted (pair-verify happened). This
     // drives selectAudioSecurityMode + the ChaCha video-cipher gate (mirror.go
     // c.encrypted), NOT shared-secret emptiness.
@@ -1409,22 +1460,31 @@ pub fn run_mirror_with_control(
 
     // ---- Select the video cipher (mirror.go:544-598 setupMirrorSession) ----
     // Take the ChaCha20-Poly1305 path when the control channel is encrypted and
-    // either a pair-verify shared secret OR the raw FairPlay AES key is present;
-    // IKM = shared secret if present, else fpAesKey (mirror.go:547-558).
-    //
-    // In this port `enc_key` (= Go c.fpKey) is always present after FairPlay SAP,
-    // and HAP encryption is always derived from the pair-verify shared secret, so
-    // `encrypted` implies a non-empty shared secret. The fpAesKey-only IKM
-    // fallback is therefore not reachable here (it would require encrypted ==
-    // true with an empty shared secret, which the HAP path never produces); the
-    // raw fpAesKey is not threaded onto Session. Otherwise (UxPlay / plaintext,
-    // not encrypted) fall back to AES-128-CTR.
+    // either a pair-verify shared secret OR the raw FairPlay AES key is present
+    // (mirror.go:547). The DataStream HKDF IKM is the shared secret when
+    // non-empty, else the raw FairPlay AES key (`session.fp_aes_key`) — matching
+    // mirror.go:552-558. The fpAesKey-only branch covers a FairPlay-SAP receiver
+    // that completed an unencrypted-secret pair-verify (empty shared secret) yet
+    // still expects the DataStream cipher; without it such a session would
+    // wrongly fall to AES-CTR. Otherwise (UxPlay / plaintext) AES-128-CTR.
     let cipher = if opts.no_encrypt {
         eprintln!("[mirror] video frame encryption DISABLED");
         VideoCipher::None
-    } else if encrypted && !pair_shared_secret.is_empty() {
-        let chacha_key =
-            derive_chacha_key(&pair_shared_secret, video_stream_connection_id)?;
+    } else if encrypted && (!pair_shared_secret.is_empty() || !fp_aes_key.is_empty()) {
+        let ikm: &[u8] = if !pair_shared_secret.is_empty() {
+            eprintln!(
+                "[mirror] DataStream HKDF IKM: pair-verify shared secret ({} bytes)",
+                pair_shared_secret.len()
+            );
+            &pair_shared_secret
+        } else {
+            eprintln!(
+                "[mirror] DataStream HKDF IKM: raw FairPlay AES key ({} bytes)",
+                fp_aes_key.len()
+            );
+            &fp_aes_key
+        };
+        let chacha_key = derive_chacha_key(ikm, video_stream_connection_id)?;
         let aead = ChaCha20Poly1305::new_from_slice(&chacha_key)
             .map_err(|_| anyhow!("chacha key length"))?;
         eprintln!("[mirror] cipher: ChaCha20-Poly1305 (HKDF-SHA512)");
@@ -1562,22 +1622,38 @@ pub fn run_mirror_with_control(
     }
 
     // ---- Capture + stream (mirror.go StreamFrames) ----
-    let capture_cfg = CaptureConfig {
-        fps: opts.fps,
-        bitrate_kbps: opts.bitrate_kbps,
-        fit_pct: opts.fit_pct,
-        force_software: opts.force_software_encoder,
-        test: opts.test,
-        restore_token: None,
-        on_restore_token: None,
+    // When the caller supplied a `FrameSource` (the daemon's shared
+    // BroadcastSink), consume from it; otherwise build and own a CaptureSource.
+    // A shared source is owned/torn down by whoever drives the BroadcastCapture
+    // pump; an owned capture we stop() on teardown.
+    let mut owned_capture: Option<CaptureSource> = None;
+    let result = match source {
+        Some(mut src) => {
+            eprintln!("[mirror] streaming from shared capture source… (Ctrl-C to stop)");
+            stream_frames(src.as_mut(), &data, &first_frame, &stop)
+        }
+        None => {
+            let capture_cfg = CaptureConfig {
+                fps: opts.fps,
+                bitrate_kbps: opts.bitrate_kbps,
+                fit_pct: opts.fit_pct,
+                force_software: opts.force_software_encoder,
+                test: opts.test,
+                restore_token: None,
+                on_restore_token: None,
+            };
+            let mut capture = CaptureSource::start(&capture_cfg).context("start capture")?;
+            eprintln!("[mirror] streaming… (Ctrl-C to stop)");
+            let r = stream_frames(&mut capture, &data, &first_frame, &stop);
+            owned_capture = Some(capture);
+            r
+        }
     };
-    let mut capture = CaptureSource::start(&capture_cfg).context("start capture")?;
-    eprintln!("[mirror] streaming… (Ctrl-C to stop)");
-
-    let result = stream_frames(&mut capture, &data, &first_frame, &stop);
 
     stop.store(true, Ordering::Relaxed);
-    capture.stop();
+    if let Some(capture) = owned_capture.as_ref() {
+        capture.stop();
+    }
 
     // Let the audio thread observe `stop` and wind down its capture/sender.
     if let Some(h) = audio_handle.take() {
@@ -1861,7 +1937,7 @@ fn spawn_feedback_loop(
 /// mirror.go's StreamFrames (without the congestion controller's logging
 /// noise; the drop logic is preserved).
 fn stream_frames(
-    capture: &mut CaptureSource,
+    capture: &mut dyn FrameSource,
     data: &Arc<Mutex<DataChannel>>,
     first_frame: &Arc<AtomicBool>,
     stop: &Arc<AtomicBool>,

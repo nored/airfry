@@ -17,15 +17,16 @@
 //! `StreamInfo` serde structs use the identical JSON field names, so the Rust
 //! `airfry-ctl` and a Go `doubletake-ctl` are wire-compatible.
 //!
-//! Difference from daemon.go worth noting: the Rust `mirror::run_mirror_with_control`
-//! is self-contained — it owns its `CaptureSource` (capture.rs) rather than
-//! reading from an injected `BroadcastSink`. There is no public mirror entry
-//! point that consumes an external source. So where Go fans ONE shared
-//! `BroadcastCapture` out to N sinks, here each target's worker drives its own
-//! capture through `run_mirror_with_control`. The daemon-visible behaviour
-//! (state machine, registry, multi-target fan-out, per-target mute/stop,
-//! pin_required parking, the wire protocol) is identical; only the capture
-//! sharing differs, dictated by the mirror API this crate exposes.
+//! Shared screen capture (daemon.go getOrStartBroadcastLocked): all targets are
+//! fanned out from ONE screen capture. The first `connect` lazily starts a single
+//! `CaptureSource`, wraps it in a `BroadcastCapture`, and spawns a pump thread.
+//! Each target then gets its own `BroadcastSink` (`add_sink`) and runs through
+//! `mirror::run_mirror_with_source(.., Some(sink))`, consuming that fan-out byte
+//! stream instead of building its own capture. The shared capture is reference-
+//! counted by the live stream set: when the LAST stream ends the capture is
+//! stopped and cleared, so a later `connect` starts a fresh one. Audio stays
+//! per-stream — `run_mirror_with_source` keeps each stream's own audio capture;
+//! only video is shared (matching Go, which shares only the `BroadcastCapture`).
 
 #![allow(dead_code)]
 
@@ -42,6 +43,8 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 
+use crate::broadcast::BroadcastCapture;
+use crate::capture::{CaptureConfig, CaptureSource, CaptureStopHandle};
 use crate::discovery::{self, AirPlayDevice};
 use crate::mirror::{self, MirrorControl, MirrorOpts};
 use crate::rtsp::Session;
@@ -82,6 +85,15 @@ struct ActiveStream {
     /// prompt. This is the channel-based analogue of daemon.go's
     /// pendingTarget/pendingPort park-and-resume.
     pin_tx: Option<Sender<Option<String>>>,
+    /// True once this stream has registered a fan-out sink on the shared capture
+    /// (daemon.go activeStream.sink != nil). The worker thread owns the live
+    /// `BroadcastSink` it reads; the daemon does not hold it. Teardown is driven
+    /// by `control.stop()` (which ends `run_mirror_with_source`, dropping the
+    /// sink — `BroadcastSink::Drop` marks it closed so the pump prunes it, the
+    /// `entry.sink.Close()` analogue) plus `maybe_stop_broadcast_locked` to stop
+    /// the shared capture once the last stream is gone. This flag exists only so
+    /// the bookkeeping reads close to daemon.go.
+    has_sink: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -133,6 +145,16 @@ struct Inner {
     /// pendingTarget/pendingPort).
     pending_target: String,
     pending_port: i32,
+    /// The single shared screen-capture fan-out feeding every target
+    /// (daemon.go `broadcast`). Created lazily on the first stream that reaches
+    /// the streaming phase and cleared when the last stream ends. The pump runs
+    /// on its own thread (spawned in `get_or_start_broadcast`).
+    broadcast: Option<Arc<BroadcastCapture>>,
+    /// A detached stop handle for the shared capture's underlying GStreamer
+    /// pipeline (daemon.go `capture` + `captureCancel`, rolled into one). Lets
+    /// `maybe_stop_broadcast_locked` tear the capture down — and thereby end the
+    /// pump's blocking read — without taking the pump's source mutex.
+    capture_stop: Option<CaptureStopHandle>,
 }
 
 /// A long-running AirFry service. Construct with `Daemon::new`, then call
@@ -156,6 +178,8 @@ impl Daemon {
                 streams: HashMap::new(),
                 pending_target: String::new(),
                 pending_port: 0,
+                broadcast: None,
+                capture_stop: None,
             }),
             shutdown: AtomicBool::new(false),
             shutdown_cv: Condvar::new(),
@@ -543,6 +567,7 @@ impl Daemon {
                 has_audio: false,
                 control: control.clone(),
                 pin_tx: None,
+                has_sink: false,
             },
         );
         let overall = Self::overall_state_locked(&inner).to_string();
@@ -703,6 +728,7 @@ impl Daemon {
             &target,
             port as u16,
             &pin,
+            &crate::rtsp::ConnectOptions::default(),
             &mut pin_provider,
             &mut report,
         ) {
@@ -714,8 +740,25 @@ impl Daemon {
             }
         };
 
+        // Obtain or lazily start the shared screen capture and register a new
+        // fan-out sink for this target (daemon.go getOrStartBroadcastLocked).
+        // This is the single capture shared by every receiver; the first stream
+        // to get here starts it, later streams just add a sink. Must be called
+        // WITHOUT the daemon lock held (it does its own locking and spawns the
+        // pump thread), exactly like Go.
+        let sink = match self.get_or_start_broadcast(&cfg) {
+            Ok(sink) => sink,
+            Err(e) => {
+                eprintln!("[daemon] capture failed for {target}: {e:#}");
+                self.remove_stream(&target);
+                return;
+            }
+        };
+
         // Record device identity + flip to streaming (daemon.go: entry.device,
-        // deviceID, state = StateStreaming, has_audio).
+        // deviceID, state = StateStreaming, sink, has_audio). If the stream was
+        // cancelled while we were setting up, drop the sink and possibly stop the
+        // now-orphaned shared capture (daemon.go's cancelled-during-setup branch).
         let has_audio = !cfg.no_audio;
         {
             let mut inner = self.inner.lock().unwrap();
@@ -735,9 +778,14 @@ impl Daemon {
                     entry.state = STATE_STREAMING;
                     entry.has_audio = has_audio;
                     entry.pin_tx = None;
+                    entry.has_sink = true;
                 }
                 None => {
-                    // Cancelled while we were pairing — drop the session.
+                    // Cancelled while we were pairing/setting up — drop the sink
+                    // and tear down the shared capture if it is now orphaned
+                    // (daemon.go: sink.Close(); maybeStopBroadcastLocked()).
+                    drop(sink);
+                    Self::maybe_stop_broadcast_locked(&mut inner);
                     return;
                 }
             }
@@ -757,10 +805,13 @@ impl Daemon {
             ..Default::default()
         };
 
-        // Run the mirror (owns its capture; daemon.go's StreamFrames). The
-        // control handle's stop flag drives shutdown; its mute state is honoured
-        // live by mute/unmute commands.
-        let result = mirror::run_mirror_with_control(session, opts, control);
+        // Run the mirror against the SHARED capture's fan-out sink (daemon.go's
+        // StreamFrames(sink.AsCapture())) rather than building a private capture.
+        // Audio stays per-stream: run_mirror_with_source keeps this stream's own
+        // audio capture; only video is shared. The control handle's stop flag
+        // drives shutdown; its mute state is honoured live by mute/unmute.
+        let result =
+            mirror::run_mirror_with_source(session, opts, control, Some(Box::new(sink)));
         if let Err(e) = result {
             if !self
                 .inner
@@ -780,8 +831,9 @@ impl Daemon {
         eprintln!("[daemon] stream ended for {target}");
     }
 
-    /// Remove a single stream entry, stopping its worker (daemon.go
-    /// removeStreamLocked + maybeStopBroadcastLocked).
+    /// Remove a single stream entry, stopping its worker, and tear down the
+    /// shared capture if no other streams remain (daemon.go removeStreamLocked,
+    /// which calls maybeStopBroadcastLocked).
     fn remove_stream(self: &Arc<Self>, target: &str) {
         let mut inner = self.inner.lock().unwrap();
         if let Some(entry) = inner.streams.remove(target) {
@@ -795,6 +847,97 @@ impl Daemon {
             inner.pending_target.clear();
             inner.pending_port = 0;
         }
+        Self::maybe_stop_broadcast_locked(&mut inner);
+    }
+
+    // -----------------------------------------------------------------------
+    // Shared screen capture lifecycle (daemon.go getOrStartBroadcastLocked /
+    // maybeStopBroadcastLocked) — ONE capture fanned out to N receivers.
+    // -----------------------------------------------------------------------
+
+    /// Ensure the single shared `BroadcastCapture` is running and return a fresh
+    /// fan-out sink registered with it (daemon.go getOrStartBroadcastLocked).
+    /// Must NOT be called with the daemon lock held.
+    ///
+    /// If a capture is already running, this just adds a sink. Otherwise it
+    /// starts a fresh `CaptureSource`, wraps it in a `BroadcastCapture`, spawns
+    /// the pump thread, and stores both the broadcast and a detached stop handle
+    /// in daemon state. A double-check after building (mirroring Go) discards a
+    /// race-built capture if another worker won.
+    fn get_or_start_broadcast(self: &Arc<Self>, cfg: &Config) -> Result<crate::broadcast::BroadcastSink> {
+        // Fast path: a capture is already running — add a sink (daemon.go).
+        {
+            let inner = self.inner.lock().unwrap();
+            if let Some(bc) = &inner.broadcast {
+                return Ok(bc.add_sink());
+            }
+        }
+
+        // Start a fresh screen capture outside the lock (daemon.go: capture is
+        // built before re-acquiring d.mu).
+        let cap_cfg = CaptureConfig {
+            fps: cfg.fps,
+            bitrate_kbps: cfg.bitrate_kbps,
+            fit_pct: 0,
+            force_software: cfg.force_software,
+            test: cfg.test_mode,
+            restore_token: None,
+            on_restore_token: None,
+        };
+        let capture = CaptureSource::start(&cap_cfg).context("start shared screen capture")?;
+        // Grab a detached stop handle BEFORE moving the capture into the
+        // broadcast (the pump holds the source behind a mutex for its whole
+        // life, so this is the only way to stop it later — see CaptureStopHandle).
+        let stop_handle = capture.stop_handle();
+        let new_bc = Arc::new(BroadcastCapture::new(capture));
+        let sink = new_bc.add_sink();
+
+        // Double-check: another worker may have started a capture concurrently
+        // (daemon.go's re-check of d.broadcast). If so, discard ours.
+        {
+            let mut inner = self.inner.lock().unwrap();
+            if let Some(existing) = &inner.broadcast {
+                let existing_sink = existing.add_sink();
+                drop(inner);
+                // Tear down the capture we just built (its pump never started).
+                drop(sink);
+                stop_handle.stop();
+                return Ok(existing_sink);
+            }
+            inner.broadcast = Some(new_bc.clone());
+            inner.capture_stop = Some(stop_handle);
+        }
+
+        // Spawn the pump thread (daemon.go's `go newBC.Run()`). When the capture
+        // ends — e.g. the portal grant is revoked or the last stream stops it —
+        // stop every active stream (daemon.go's deferred stopAllLocked).
+        let me = self.clone();
+        let bc_run = new_bc;
+        thread::spawn(move || {
+            if let Err(e) = bc_run.run() {
+                if e.to_string() != "EOF" {
+                    eprintln!("[daemon] broadcast capture error: {e:#}");
+                }
+            }
+            let mut inner = me.inner.lock().unwrap();
+            Self::stop_all_locked(&mut inner);
+        });
+
+        Ok(sink)
+    }
+
+    /// Stop the shared capture if no active streams remain (daemon.go
+    /// maybeStopBroadcastLocked). Must be called with `inner` held. Stopping the
+    /// capture's pipeline ends the pump's blocking read, so `BroadcastCapture::run`
+    /// returns and its thread finishes.
+    fn maybe_stop_broadcast_locked(inner: &mut Inner) {
+        if !inner.streams.is_empty() {
+            return;
+        }
+        if let Some(stop) = inner.capture_stop.take() {
+            stop.stop();
+        }
+        inner.broadcast = None;
     }
 
     // -----------------------------------------------------------------------
@@ -816,6 +959,9 @@ impl Daemon {
                         inner.pending_target.clear();
                         inner.pending_port = 0;
                     }
+                    // Tear down the shared capture if that was the last stream
+                    // (daemon.go: maybeStopBroadcastLocked after delete).
+                    Self::maybe_stop_broadcast_locked(&mut inner);
                     return Response {
                         ok: true,
                         state: Self::overall_state_locked(&inner).to_string(),
@@ -844,8 +990,8 @@ impl Daemon {
         }
     }
 
-    /// Stop every active stream (daemon.go stopAllLocked). Must be called with
-    /// `inner` held.
+    /// Stop every active stream AND tear down the shared capture (daemon.go
+    /// stopAllLocked). Must be called with `inner` held.
     fn stop_all_locked(inner: &mut Inner) {
         for (_, entry) in inner.streams.drain() {
             entry.control.stop();
@@ -855,6 +1001,12 @@ impl Daemon {
         }
         inner.pending_target.clear();
         inner.pending_port = 0;
+        // Stop the shared screen capture + clear it (daemon.go stopAllLocked:
+        // capture.Stop(); captureCancel(); broadcast = nil).
+        if let Some(stop) = inner.capture_stop.take() {
+            stop.stop();
+        }
+        inner.broadcast = None;
     }
 
     // -----------------------------------------------------------------------
@@ -1172,6 +1324,104 @@ mod tests {
         fn expect_err_is_ok_false(self) -> Response {
             self.expect("pin call should reach the daemon")
         }
+    }
+
+    /// Shared-capture lifecycle (daemon.go getOrStartBroadcastLocked /
+    /// maybeStopBroadcastLocked): the FIRST stream lazily starts ONE capture;
+    /// the SECOND reuses it (no second capture); removing the streams one by one
+    /// keeps the capture alive until the LAST is gone, which clears it so a later
+    /// connect starts fresh. Uses test-mode capture (no display/portal needed);
+    /// skips if GStreamer/videotestsrc is unavailable in the environment.
+    #[test]
+    fn shared_capture_create_on_first_stop_on_last() {
+        let mut cfg = Config::default();
+        cfg.test_mode = true;
+        let daemon = Daemon::new(cfg);
+
+        // Helper: register a connecting placeholder for a target (as handle_connect
+        // does) so maybe_stop_broadcast_locked counts it as an active stream.
+        let register = |ip: &str| {
+            let mut inner = daemon.inner.lock().unwrap();
+            inner.streams.insert(
+                ip.to_string(),
+                ActiveStream {
+                    device: String::new(),
+                    device_ip: ip.to_string(),
+                    device_id: String::new(),
+                    state: STATE_STREAMING,
+                    audio_muted: false,
+                    has_audio: false,
+                    control: MirrorControl::new(),
+                    pin_tx: None,
+                    has_sink: true,
+                },
+            );
+        };
+
+        register("10.0.0.1");
+        let cfg = daemon.inner.lock().unwrap().cfg.clone();
+        let sink1 = match daemon.get_or_start_broadcast(&cfg) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("skip shared_capture test: capture unavailable: {e:#}");
+                return;
+            }
+        };
+        // First stream started the one shared capture.
+        assert!(daemon.inner.lock().unwrap().broadcast.is_some());
+        assert!(daemon.inner.lock().unwrap().capture_stop.is_some());
+        let bc_ptr = Arc::as_ptr(daemon.inner.lock().unwrap().broadcast.as_ref().unwrap());
+
+        // Second stream reuses the SAME capture (no new BroadcastCapture).
+        register("10.0.0.2");
+        let sink2 = daemon.get_or_start_broadcast(&cfg).expect("second sink");
+        let bc_ptr2 = Arc::as_ptr(daemon.inner.lock().unwrap().broadcast.as_ref().unwrap());
+        assert_eq!(bc_ptr, bc_ptr2, "second stream must reuse the shared capture");
+
+        // Both sinks read the SAME live frames off the one capture.
+        let mut s1 = sink1;
+        let mut s2 = sink2;
+        let mut b1 = [0u8; 1024];
+        let mut b2 = [0u8; 1024];
+        assert!(s1.read(&mut b1).unwrap() > 0, "sink1 receives frames");
+        assert!(s2.read(&mut b2).unwrap() > 0, "sink2 receives frames");
+
+        // Remove the first stream: capture stays up (one stream remains).
+        {
+            let mut inner = daemon.inner.lock().unwrap();
+            inner.streams.remove("10.0.0.1");
+            Daemon::maybe_stop_broadcast_locked(&mut inner);
+        }
+        drop(s1);
+        assert!(
+            daemon.inner.lock().unwrap().broadcast.is_some(),
+            "capture stays up while a stream remains"
+        );
+
+        // Remove the LAST stream: capture is stopped and cleared.
+        {
+            let mut inner = daemon.inner.lock().unwrap();
+            inner.streams.remove("10.0.0.2");
+            Daemon::maybe_stop_broadcast_locked(&mut inner);
+        }
+        drop(s2);
+        assert!(
+            daemon.inner.lock().unwrap().broadcast.is_none(),
+            "capture cleared after the last stream ends"
+        );
+        assert!(daemon.inner.lock().unwrap().capture_stop.is_none());
+
+        // A later connect can start a fresh capture again.
+        register("10.0.0.3");
+        let sink3 = daemon.get_or_start_broadcast(&cfg).expect("fresh capture");
+        assert!(daemon.inner.lock().unwrap().broadcast.is_some());
+        drop(sink3);
+        {
+            let mut inner = daemon.inner.lock().unwrap();
+            inner.streams.remove("10.0.0.3");
+            Daemon::maybe_stop_broadcast_locked(&mut inner);
+        }
+        assert!(daemon.inner.lock().unwrap().broadcast.is_none());
     }
 
     #[test]

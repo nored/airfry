@@ -10,6 +10,7 @@ mod broadcast;
 mod capture;
 mod credentials;
 mod daemon;
+mod dbglog;
 mod daemonclient;
 mod discovery;
 mod fairplay;
@@ -34,6 +35,7 @@ use mirror::MirrorControl;
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
+    dbglog::init_from_env();
     // doubletake's -target-latency-ms defaults to 100ms (main.go:59); its
     // latency.init sets only 1ms, so the effective default is 100ms. Match it.
     latency::set_target_latency(Duration::from_millis(100));
@@ -213,39 +215,21 @@ fn apply_global_flags(f: &CliFlags) -> Result<(), String> {
         std::env::set_var("AIRFRY_HWACCEL", mode);
     }
     if f.debug {
-        // doubletake sets airplay.DebugMode (main.go:73); airfry has no global
-        // debug toggle yet, so expose it via the same env channel as the other
-        // settings for any layer that opts to read it.
+        // doubletake sets airplay.DebugMode (main.go:73). Set the global debug
+        // toggle (gates the dlog! macro) and the env channel so the daemon/tray
+        // code paths pick it up too.
+        dbglog::set_debug(true);
         std::env::set_var("AIRFRY_DEBUG", "1");
     }
     match f.cred_backend.as_str() {
-        "file" => {}
-        "keyring" => {
-            return Err(
-                "credential backend 'keyring' is not implemented; use --cred-backend file"
-                    .to_string(),
-            )
-        }
+        // file and keyring are both wired through ConnectOptions into the
+        // handshake's credential store (rtsp.rs). --pair and --creds are too.
+        "file" | "keyring" => {}
         other => {
             return Err(format!(
                 "unknown credential backend {other:?} (use \"file\" or \"keyring\")"
             ))
         }
-    }
-    if f.force_pair {
-        // -pair forces a fresh pairing even with saved creds. The current rtsp
-        // handshake always reuses the default credential store; honoring this
-        // requires an rtsp-side toggle, so warn rather than silently ignore.
-        eprintln!(
-            "[warn] --pair: forced re-pairing is not yet wired through the handshake; \
-             saved credentials (if any) will still be reused"
-        );
-    }
-    if f.creds_path.is_some() {
-        eprintln!(
-            "[warn] --creds: a custom credential path is not yet threaded through the \
-             handshake; using the default store"
-        );
     }
     Ok(())
 }
@@ -386,7 +370,18 @@ fn cmd_pair(args: &[String]) -> i32 {
     };
     let mut ask = ask_pin;
 
-    match rtsp::Session::connect_host_with(&host, port, &flags.pin, &mut ask, &mut report) {
+    match rtsp::Session::connect_host_with(
+        &host,
+        port,
+        &flags.pin,
+        &rtsp::ConnectOptions {
+            force_pair: flags.force_pair,
+            creds_path: flags.creds_path.clone(),
+            keyring: flags.cred_backend == "keyring",
+        },
+        &mut ask,
+        &mut report,
+    ) {
         Ok(session) => {
             println!("\nSession established.");
             println!("  stream key : {}", hex_str(&session.stream_key));
@@ -443,7 +438,18 @@ fn cmd_mirror(args: &[String]) -> i32 {
     let mut ask = ask_pin;
 
     let session =
-        match rtsp::Session::connect_host_with(&host, port, &flags.pin, &mut ask, &mut report) {
+        match rtsp::Session::connect_host_with(
+        &host,
+        port,
+        &flags.pin,
+        &rtsp::ConnectOptions {
+            force_pair: flags.force_pair,
+            creds_path: flags.creds_path.clone(),
+            keyring: flags.cred_backend == "keyring",
+        },
+        &mut ask,
+        &mut report,
+    ) {
             Ok(s) => s,
             Err(e) => {
                 eprintln!("pairing failed: {e:#}");

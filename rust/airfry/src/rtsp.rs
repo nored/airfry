@@ -11,6 +11,7 @@
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
+use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -400,6 +401,31 @@ fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
         .position(|w| w == needle)
 }
 
+/// Optional knobs for the connect handshake, mirroring doubletake's `-pair`
+/// (force re-pair) and `-creds` (custom store path) command-line flags
+/// (main.go:54, 56, 130-161).
+///
+/// Defaults (`ConnectOptions::default()`) reproduce the pre-existing behaviour:
+/// honour saved credentials and use the default credential-store path.
+#[derive(Clone, Default)]
+pub struct ConnectOptions {
+    /// Force a fresh pairing from scratch (doubletake `-pair`, main.go:56,130).
+    /// When true, the saved-credentials pair-verify fast path (main.go:162-203)
+    /// is skipped entirely: we go straight to a transient->PIN pairing and
+    /// re-persist the resulting identity, exactly like main.go's `needFullPair`
+    /// branch which does NOT call `credStore.Lookup` (main.go:137-140).
+    pub force_pair: bool,
+
+    /// Override the credential-store path (doubletake `-creds`, main.go:54).
+    /// `None` opens the default store (`CredentialStore::open_default`); `Some(p)`
+    /// opens the store at `p` via `CredentialStore::open(&p)`.
+    pub creds_path: Option<PathBuf>,
+
+    /// Use the system keyring (Secret Service) credential backend instead of the
+    /// JSON file (doubletake `-cred-backend keyring`, main.go:55).
+    pub keyring: bool,
+}
+
 /// A fully-established AirPlay session: socket is paired (and possibly HAP
 /// encrypted) and the FairPlay stream key / IV are ready for the mirror stage.
 pub struct Session {
@@ -418,6 +444,13 @@ pub struct Session {
     pub stream_key: [u8; 16],
     pub iv: [u8; 16],
     pub ekey: Vec<u8>,
+
+    /// The raw 16-byte FairPlay AES key (the pre-hash PlayFair key, before the
+    /// optional SHA-512 mix with the pair-verify shared secret). The mirror
+    /// layer uses this as the ChaCha20 IKM fallback when the FairPlay stream key
+    /// is the chosen keying material (mirror.go:547-558). Empty/all-zero when
+    /// FairPlay SAP was unsupported and the soft-fallback path was taken.
+    pub fp_aes_key: Vec<u8>,
 
     /// Our pairing identifier (UUID), reused by later RTSP requests.
     pub pairing_id: String,
@@ -447,6 +480,7 @@ impl Session {
             "",
             &mds_pk,
             &device_key,
+            &ConnectOptions::default(),
             &mut || None,
             &mut |_, _, _| {},
         )
@@ -455,41 +489,72 @@ impl Session {
     /// Like `connect`, but takes an explicit host/port and optional PIN.
     /// An empty `pin` selects the transient (PIN-less) flow.
     pub fn connect_host(host: &str, port: u16, pin: &str) -> Result<Session> {
-        Self::connect_host_with(host, port, pin, &mut || None, &mut |_phase, _ok, _detail| {})
+        Self::connect_host_with(
+            host,
+            port,
+            pin,
+            &ConnectOptions::default(),
+            &mut || None,
+            &mut |_phase, _ok, _detail| {},
+        )
     }
 
     /// Full handshake with a progress callback: `progress(phase, ok, detail)`.
     /// `pin_provider` is called to obtain the displayed pairing code when the
     /// receiver rejects PIN-less pairing (return `None` to abort).
+    ///
+    /// `opts` carries the `-pair`/`-creds` knobs (see [`ConnectOptions`]); pass
+    /// `&ConnectOptions::default()` for the historical behaviour.
     pub fn connect_host_with(
         host: &str,
         port: u16,
         pin: &str,
+        opts: &ConnectOptions,
         pin_provider: &mut dyn FnMut() -> Option<String>,
         progress: &mut dyn FnMut(&str, bool, &str),
     ) -> Result<Session> {
         // Key the credential store by host when no stable device id is known.
-        Self::connect_host_full(host, port, pin, &[], host, pin_provider, progress)
+        Self::connect_host_full(host, port, pin, &[], host, opts, pin_provider, progress)
     }
 
     /// Full handshake, with an optional caller-supplied receiver ed25519 PK
     /// (e.g. from the mDNS `pk` record) used as a fallback for the raw
     /// pair-verify signature check.
+    #[allow(clippy::too_many_arguments)]
     fn connect_host_full(
         host: &str,
         port: u16,
         pin: &str,
         mdns_pk: &[u8],
         device_id: &str,
+        opts: &ConnectOptions,
         pin_provider: &mut dyn FnMut() -> Option<String>,
         progress: &mut dyn FnMut(&str, bool, &str),
     ) -> Result<Session> {
-        // Open the persistent credential store (non-fatal on any IO error) and
-        // reuse a previously-saved pairing identity for this device when present.
-        // Reusing the ed25519 identity lets the receiver recognise this sender as
-        // a known controller across runs.
-        let mut cred_store = CredentialStore::open_default();
-        let saved = cred_store.lookup(device_id);
+        // Open the persistent credential store (non-fatal on any IO error) at the
+        // caller-chosen path (doubletake `-creds`, main.go:54) or the default
+        // path, and reuse a previously-saved pairing identity for this device
+        // when present. Reusing the ed25519 identity lets the receiver recognise
+        // this sender as a known controller across runs.
+        let mut cred_store = if opts.keyring {
+            CredentialStore::open_keyring().unwrap_or_else(|_| CredentialStore::open_default())
+        } else {
+            match &opts.creds_path {
+                Some(p) => {
+                    CredentialStore::open(p).unwrap_or_else(|_| CredentialStore::open_default())
+                }
+                None => CredentialStore::open_default(),
+            }
+        };
+        // doubletake only consults saved credentials when NOT forcing a re-pair:
+        // `needFullPair := *forcePair || *pin != ""` gates the `credStore.Lookup`
+        // call (main.go:130,137-140). When force_pair is set we behave as if no
+        // saved credentials exist, so the saved-creds fast path below is skipped.
+        let saved = if opts.force_pair {
+            None
+        } else {
+            cred_store.lookup(device_id)
+        };
         let pairing_id = match &saved {
             Some(c) if c.has_pairing_credentials() => c.pairing_id.clone(),
             _ => pairing::generate_uuid(),
@@ -678,6 +743,11 @@ impl Session {
             stream_key: fp.stream_key,
             iv: fp.iv,
             ekey: fp.ekey,
+            // Raw pre-hash PlayFair AES key, exposed as the ChaCha20 IKM fallback
+            // for the mirror layer (mirror.go:547-558). On the soft-fallback path
+            // `aes_key` is all-zero (FairPlayKeys above), which the mirror layer
+            // treats as "no FairPlay key" just like an empty ekey.
+            fp_aes_key: fp.aes_key.to_vec(),
             pairing_id,
             session_id,
             info,
