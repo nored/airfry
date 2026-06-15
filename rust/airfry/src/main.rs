@@ -6,6 +6,7 @@
 //! (research-only submodule; see third_party/doubletake) — credit: omarroth.
 
 mod discovery;
+mod playfair;
 
 use std::time::Duration;
 
