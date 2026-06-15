@@ -45,7 +45,7 @@ use sha2::{Digest, Sha512};
 
 use crate::audio::{self, AudioSecurityMode};
 use crate::broadcast::BroadcastSink;
-use crate::capture::{CaptureConfig, CaptureSource};
+use crate::capture::{CaptureConfig, CaptureSource, LiveFit};
 use crate::latency;
 use crate::rtsp::{Session, Transport};
 
@@ -109,6 +109,9 @@ pub struct MirrorOpts {
     /// (main.go -test / capture.go StartTestCapture). Lets mirroring run with no
     /// display/portal. Forwarded to `CaptureConfig.test`.
     pub test: bool,
+    /// Keep the underscan stage live so `MirrorControl::set_underscan` can retune
+    /// it mid-stream (the tray sets this). Forwarded to `CaptureConfig.live_underscan`.
+    pub live_underscan: bool,
 }
 
 impl Default for MirrorOpts {
@@ -124,6 +127,7 @@ impl Default for MirrorOpts {
             direct_key: false,
             port_range: None,
             test: false,
+            live_underscan: false,
         }
     }
 }
@@ -175,6 +179,10 @@ pub struct MirrorControl {
     /// Set by run once the control channel + audio URI are ready. `None` until
     /// then (or after teardown).
     chan: Arc<Mutex<Option<MuteChannel>>>,
+    /// Live underscan handle, bound once the capture pipeline is up. `set_underscan`
+    /// applies through it; `None` until then (or after teardown), or when this
+    /// mirror was not started with `live_underscan`.
+    fit: Arc<Mutex<Option<LiveFit>>>,
 }
 
 struct MuteChannel {
@@ -199,6 +207,7 @@ impl MirrorControl {
             stop,
             muted: Arc::new(AtomicBool::new(false)),
             chan: Arc::new(Mutex::new(None)),
+            fit: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -234,12 +243,31 @@ impl MirrorControl {
         Ok(())
     }
 
+    /// Retune the underscan border LIVE on the running pipeline (0..=25 %). A
+    /// no-op if this mirror has no live fit stage (not started with
+    /// `live_underscan`, or torn down). No reconnect, no portal re-prompt.
+    pub fn set_underscan(&self, pct: u8) {
+        if let Some(lf) = self.fit.lock().unwrap().as_ref() {
+            lf.apply(pct);
+        }
+    }
+
+    /// True if this control can adjust underscan live right now.
+    pub fn has_live_underscan(&self) -> bool {
+        self.fit.lock().unwrap().is_some()
+    }
+
     fn bind(&self, control: Arc<Mutex<Transport>>, audio_uri: String) {
         *self.chan.lock().unwrap() = Some(MuteChannel { control, audio_uri });
     }
 
+    fn bind_fit(&self, lf: LiveFit) {
+        *self.fit.lock().unwrap() = Some(lf);
+    }
+
     fn unbind(&self) {
         *self.chan.lock().unwrap() = None;
+        *self.fit.lock().unwrap() = None;
     }
 }
 
@@ -1015,7 +1043,7 @@ pub fn run_mirror_with_source(
     // DisplaySize() when nonzero, else sendCodecFrame falls back to content size).
     let (display_w, display_h) = session.info.display_size();
     if display_w > 0 && display_h > 0 {
-        eprintln!("[mirror] receiver display size: {display_w}x{display_h}");
+        crate::dlog!("[mirror] receiver display size: {display_w}x{display_h}");
     }
 
     // Keep the pieces we need from the session before moving the control
@@ -1070,7 +1098,7 @@ pub fn run_mirror_with_source(
     let event_listener =
         listen_tcp_avoiding(timing_port, opts.port_range).context("listen event port")?;
     let event_port = event_listener.local_addr()?.port();
-    eprintln!("[mirror] event listener on TCP port {event_port}");
+    crate::dlog!("[mirror] event listener on TCP port {event_port}");
     {
         let stop = stop.clone();
         std::thread::spawn(move || event_accept_loop(event_listener, stop));
@@ -1243,7 +1271,7 @@ pub fn run_mirror_with_source(
         .and_then(extract_audio_ports)
         .unwrap_or((0, 0));
     if audio_data_port > 0 {
-        eprintln!(
+        crate::dlog!(
             "[audio] stream: dataPort={audio_data_port} controlPort={audio_control_port}"
         );
     }
@@ -1337,25 +1365,27 @@ pub fn run_mirror_with_source(
     // Connect to the receiver's event port if it advertised one (mirror.go:439-448).
     // The connection is kept open for the session lifetime as the outbound event
     // channel; we hold it so it is not dropped/closed early.
-    let _receiver_event_conn: Option<TcpStream> = if receiver_event_port > 0 {
+    if receiver_event_port > 0 {
         use std::net::ToSocketAddrs;
         let event_addr = format!("{host}:{receiver_event_port}");
-        match event_addr.to_socket_addrs().ok().and_then(|mut a| a.next()) {
-            Some(sa) => match TcpStream::connect_timeout(&sa, Duration::from_secs(3)) {
+        if let Some(sa) = event_addr.to_socket_addrs().ok().and_then(|mut a| a.next()) {
+            match TcpStream::connect_timeout(&sa, Duration::from_secs(3)) {
                 Ok(c) => {
-                    eprintln!("[event] connected to receiver event port {event_addr}");
-                    Some(c)
+                    crate::dlog!("[event] connected to receiver event port {event_addr}");
+                    // Drain AND decrypt the receiver's event channel so we can see
+                    // what the TV is actually telling us (it pushes encrypted RTSP
+                    // events here). Tries candidate HAP keys derived from the
+                    // pair-verify shared secret and logs the decrypted plaintext.
+                    let secret = pair_shared_secret.clone();
+                    let stop_evt = stop.clone();
+                    std::thread::spawn(move || decrypt_event_channel(c, secret, stop_evt));
                 }
                 Err(e) => {
-                    eprintln!("[event] connect to receiver event port {event_addr} failed: {e}");
-                    None
+                    crate::dlog!("[event] connect to receiver event port {event_addr} failed: {e}")
                 }
-            },
-            None => None,
+            }
         }
-    } else {
-        None
-    };
+    }
 
     // Extract the video data port (type=110 stream's dataPort).
     let data_port = extract_video_data_port(&video_resp_plist)
@@ -1377,7 +1407,38 @@ pub fn run_mirror_with_source(
     )
     .with_context(|| format!("connect data port {data_addr}"))?;
     conn.set_nodelay(true).ok();
-    eprintln!("[mirror] data channel connected: {data_addr}");
+    crate::dlog!("[mirror] data channel connected: {data_addr}");
+
+    // Drain the data channel. The receiver sends back-channel bytes on this same
+    // TCP connection; if we never read them, our kernel receive buffer fills, the
+    // receiver's writes block, and after ~25-30s it RSTs the whole session
+    // (observed: TV sent 3 RSTs to a non-draining sender, 0 to a draining one).
+    // doubletake drains it via a goroutine (mirror.go:620). Read on a CLONED
+    // handle so the video writes (under the data lock) and this drain run
+    // concurrently — TCP is full-duplex.
+    if let Ok(mut drain) = conn.try_clone() {
+        let stop_drain = stop.clone();
+        let _ = drain.set_read_timeout(Some(Duration::from_secs(1)));
+        std::thread::spawn(move || {
+            let mut buf = [0u8; 4096];
+            loop {
+                if stop_drain.load(Ordering::Relaxed) {
+                    return;
+                }
+                match drain.read(&mut buf) {
+                    Ok(0) => return, // receiver closed the data channel
+                    Ok(_) => {}      // discard back-channel bytes
+                    Err(ref e)
+                        if e.kind() == std::io::ErrorKind::WouldBlock
+                            || e.kind() == std::io::ErrorKind::TimedOut =>
+                    {
+                        continue
+                    }
+                    Err(_) => return,
+                }
+            }
+        });
+    }
 
     // ---- RECORD to start the session ----
     let record_resp = control
@@ -1407,7 +1468,7 @@ pub fn run_mirror_with_source(
                 session_latency = Duration::from_nanos(
                     (parsed as u64) * 1_000_000_000 / 44_100,
                 );
-                eprintln!(
+                crate::dlog!(
                     "[mirror] receiver audio latency: {parsed} samples ({:?}); using for audio+video",
                     session_latency
                 );
@@ -1468,17 +1529,17 @@ pub fn run_mirror_with_source(
     // still expects the DataStream cipher; without it such a session would
     // wrongly fall to AES-CTR. Otherwise (UxPlay / plaintext) AES-128-CTR.
     let cipher = if opts.no_encrypt {
-        eprintln!("[mirror] video frame encryption DISABLED");
+        crate::dlog!("[mirror] video frame encryption DISABLED");
         VideoCipher::None
     } else if encrypted && (!pair_shared_secret.is_empty() || !fp_aes_key.is_empty()) {
         let ikm: &[u8] = if !pair_shared_secret.is_empty() {
-            eprintln!(
+            crate::dlog!(
                 "[mirror] DataStream HKDF IKM: pair-verify shared secret ({} bytes)",
                 pair_shared_secret.len()
             );
             &pair_shared_secret
         } else {
-            eprintln!(
+            crate::dlog!(
                 "[mirror] DataStream HKDF IKM: raw FairPlay AES key ({} bytes)",
                 fp_aes_key.len()
             );
@@ -1487,16 +1548,16 @@ pub fn run_mirror_with_source(
         let chacha_key = derive_chacha_key(ikm, video_stream_connection_id)?;
         let aead = ChaCha20Poly1305::new_from_slice(&chacha_key)
             .map_err(|_| anyhow!("chacha key length"))?;
-        eprintln!("[mirror] cipher: ChaCha20-Poly1305 (HKDF-SHA512)");
+        crate::dlog!("[mirror] cipher: ChaCha20-Poly1305 (HKDF-SHA512)");
         VideoCipher::ChaCha { aead, nonce: 0 }
     } else if opts.direct_key {
         // direct-key (mirror.go:577-580): use shk/shiv directly, no SHA-512
         // derivation. shk/shiv are the raw stream key/IV (enc_key/enc_iv).
-        eprintln!("[mirror] cipher: AES-128-CTR (DIRECT key, no SHA-512 derivation)");
+        crate::dlog!("[mirror] cipher: AES-128-CTR (DIRECT key, no SHA-512 derivation)");
         VideoCipher::AesCtr(MirrorCipher::new(&enc_key, &enc_iv))
     } else {
         let (k, iv) = derive_video_keys(&enc_key, video_stream_connection_id);
-        eprintln!("[mirror] cipher: AES-128-CTR (SHA-512 derived)");
+        crate::dlog!("[mirror] cipher: AES-128-CTR (SHA-512 derived)");
         VideoCipher::AesCtr(MirrorCipher::new(&k, &iv))
     };
 
@@ -1555,11 +1616,10 @@ pub fn run_mirror_with_source(
     );
     spawn_feedback_loop(control.clone(), stop.clone());
 
-    // Ctrl-C handler: flip the stop flag so the capture loop exits cleanly.
-    {
-        let stop = stop.clone();
-        let _ = ctrlc_set(move || stop.store(true, Ordering::Relaxed));
-    }
+    // NOTE: do NOT install a Ctrl-C handler here. The CLI (cmd_mirror) installs
+    // its own SIGINT/SIGTERM handler; the tray must NOT have one hijacked by the
+    // mirror worker (it would catch Ctrl-C and only stop the mirror, never let
+    // the tray process exit). ctrlc::set_handler is process-global + once-only.
 
     // ---- Audio: set up the RTP audio stream + start capture, then run the
     // StreamAudio loop on its own thread gated on the same first-frame / stop
@@ -1587,7 +1647,7 @@ pub fn run_mirror_with_source(
                         let audio_stream = Arc::new(Mutex::new(stream));
                         match audio::AudioCapture::start(opts.test) {
                             Ok(mut capture) => {
-                                eprintln!("[audio] capture started; streaming audio alongside video");
+                                crate::dlog!("[audio] capture started; streaming audio alongside video");
                                 let first_frame = first_frame.clone();
                                 let stop = stop.clone();
                                 let boot = boot_origin();
@@ -1599,26 +1659,26 @@ pub fn run_mirror_with_source(
                                         &stop,
                                         boot,
                                     ) {
-                                        eprintln!("[audio] stream ended: {e}");
+                                        crate::dlog!("[audio] stream ended: {e}");
                                     }
                                     capture.stop();
                                 }));
                             }
                             Err(e) => {
-                                eprintln!("[audio] capture start failed: {e}; continuing video-only");
+                                crate::dlog!("[audio] capture start failed: {e}; continuing video-only");
                             }
                         }
                     }
                     Err(e) => {
-                        eprintln!("[audio] stream setup failed: {e}; continuing video-only");
+                        crate::dlog!("[audio] stream setup failed: {e}; continuing video-only");
                     }
                 }
             } else {
-                eprintln!("[audio] receiver did not provide audio ports; skipping audio");
+                crate::dlog!("[audio] receiver did not provide audio ports; skipping audio");
             }
         }
     } else {
-        eprintln!("[audio] disabled (--no-audio)");
+        crate::dlog!("[audio] disabled (--no-audio)");
     }
 
     // ---- Capture + stream (mirror.go StreamFrames) ----
@@ -1629,7 +1689,7 @@ pub fn run_mirror_with_source(
     let mut owned_capture: Option<CaptureSource> = None;
     let result = match source {
         Some(mut src) => {
-            eprintln!("[mirror] streaming from shared capture source… (Ctrl-C to stop)");
+            crate::dlog!("[mirror] streaming from shared capture source… (Ctrl-C to stop)");
             stream_frames(src.as_mut(), &data, &first_frame, &stop)
         }
         None => {
@@ -1637,13 +1697,19 @@ pub fn run_mirror_with_source(
                 fps: opts.fps,
                 bitrate_kbps: opts.bitrate_kbps,
                 fit_pct: opts.fit_pct,
+                live_underscan: opts.live_underscan,
                 force_software: opts.force_software_encoder,
                 test: opts.test,
                 restore_token: None,
                 on_restore_token: None,
             };
             let mut capture = CaptureSource::start(&capture_cfg).context("start capture")?;
-            eprintln!("[mirror] streaming… (Ctrl-C to stop)");
+            // Hand the live underscan handle to the control so the tray can
+            // retune the border mid-stream (slider / scroll), no rebuild.
+            if let Some(lf) = capture.live_fit() {
+                control_handle.bind_fit(lf);
+            }
+            crate::dlog!("[mirror] streaming… (Ctrl-C to stop)");
             let r = stream_frames(&mut capture, &data, &first_frame, &stop);
             owned_capture = Some(capture);
             r
@@ -1773,7 +1839,7 @@ fn listen_tcp_avoiding(
 fn event_accept_loop(listener: std::net::TcpListener, stop: Arc<AtomicBool>) {
     let conn = match listener.accept() {
         Ok((c, addr)) => {
-            eprintln!("[event] Apple TV connected for reverse events from {addr}");
+            crate::dlog!("[event] Apple TV connected for reverse events from {addr}");
             c
         }
         Err(_) => return,
@@ -1936,6 +2002,187 @@ fn spawn_feedback_loop(
 /// stream_frames — the NAL-parsing send loop, a faithful port of
 /// mirror.go's StreamFrames (without the congestion controller's logging
 /// noise; the drop logic is preserved).
+/// Read, decrypt, and log the receiver's event channel so we can see what the
+/// TV actually sends (encrypted RTSP events). HAP framing is `[u16 LE len]
+/// [ciphertext len+16]`, ChaCha20-Poly1305, nonce `[0;4]||LE64(counter)` from 0,
+/// AAD = the 2-byte length. We don't know which key the event channel uses, so we
+/// try several candidates derived from the pair-verify shared secret and lock
+/// onto whichever decrypts the first frame.
+/// Parse one complete RTSP request from `buf`. Returns (CSeq, total bytes
+/// consumed) once the full headers + Content-Length body are present, else None.
+fn parse_rtsp_request(buf: &[u8]) -> Option<(u32, usize)> {
+    let hdr_end = find_subseq(buf, b"\r\n\r\n")? + 4;
+    let head = String::from_utf8_lossy(&buf[..hdr_end]);
+    let mut cseq = 0u32;
+    let mut content_len = 0usize;
+    for line in head.lines() {
+        let l = line.to_ascii_lowercase();
+        if let Some(v) = l.strip_prefix("cseq:") {
+            cseq = v.trim().parse().unwrap_or(0);
+        } else if let Some(v) = l.strip_prefix("content-length:") {
+            content_len = v.trim().parse().unwrap_or(0);
+        }
+    }
+    let total = hdr_end + content_len;
+    if buf.len() < total {
+        return None; // body not fully arrived yet
+    }
+    Some((cseq, total))
+}
+
+fn find_subseq(hay: &[u8], needle: &[u8]) -> Option<usize> {
+    hay.windows(needle.len()).position(|w| w == needle)
+}
+
+fn decrypt_event_channel(mut conn: TcpStream, secret: Vec<u8>, stop: Arc<AtomicBool>) {
+    let _ = conn.set_read_timeout(Some(Duration::from_secs(2)));
+    let derive = |salt: &[u8], info: &[u8]| -> [u8; 32] {
+        let hk = Hkdf::<Sha512>::new(Some(salt), &secret);
+        let mut k = [0u8; 32];
+        let _ = hk.expand(info, &mut k);
+        k
+    };
+    // Sender's perspective: "Read" = receiver->sender. Try Events-* and Control-*
+    // in both directions in case the naming/derivation differs.
+    let candidates: Vec<(&str, [u8; 32])> = vec![
+        ("Events-Read", derive(b"Events-Salt", b"Events-Read-Encryption-Key")),
+        ("Events-Write", derive(b"Events-Salt", b"Events-Write-Encryption-Key")),
+        ("Control-Read", derive(b"Control-Salt", b"Control-Read-Encryption-Key")),
+        ("Control-Write", derive(b"Control-Salt", b"Control-Write-Encryption-Key")),
+    ];
+    let hx = |b: &[u8]| -> String { b.iter().map(|x| format!("{x:02x}")).collect() };
+    let mut nonces = vec![0u64; candidates.len()];
+    let mut chosen: Option<usize> = None;
+    let mut buf: Vec<u8> = Vec::new();
+    let mut tmp = [0u8; 8192];
+    let mut logged_raw = false;
+
+    // The receiver sends RTSP requests (e.g. POST /command) on this channel and
+    // expects RTSP responses; without a reply it RSTs the whole session at ~30s.
+    // We write responses encrypted with the COMPLEMENTARY key — the receiver
+    // sends with Events-Write, so it reads our writes with Events-Read.
+    let resp_key = derive(b"Events-Salt", b"Events-Read-Encryption-Key");
+    let mut resp_nonce: u64 = 0;
+    let mut req: Vec<u8> = Vec::new(); // accumulates one RTSP request across frames
+    loop {
+        if stop.load(Ordering::Relaxed) {
+            return;
+        }
+        match conn.read(&mut tmp) {
+            Ok(0) => {
+                crate::dlog!("[event] receiver closed the event channel");
+                return;
+            }
+            Ok(n) => buf.extend_from_slice(&tmp[..n]),
+            Err(ref e)
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut =>
+            {
+                continue
+            }
+            Err(_) => return,
+        }
+        if !logged_raw && buf.len() >= 4 {
+            crate::dlog!(
+                "[event] raw first {} bytes: {}",
+                buf.len().min(64),
+                hx(&buf[..buf.len().min(64)])
+            );
+            logged_raw = true;
+        }
+        // Try to parse HAP frames.
+        loop {
+            if buf.len() < 2 {
+                break;
+            }
+            let len = u16::from_le_bytes([buf[0], buf[1]]) as usize;
+            if len == 0 || len > 1500 {
+                if chosen.is_none() {
+                    crate::dlog!(
+                        "[event] not HAP-framed (len field={len}); raw: {}",
+                        hx(&buf[..buf.len().min(64)])
+                    );
+                }
+                return;
+            }
+            if buf.len() < 2 + len + 16 {
+                break;
+            }
+            let aad = [buf[0], buf[1]];
+            let ct = buf[2..2 + len + 16].to_vec();
+            let idxs: Vec<usize> = match chosen {
+                Some(i) => vec![i],
+                None => (0..candidates.len()).collect(),
+            };
+            let mut ok = false;
+            for &i in &idxs {
+                let cipher = match ChaCha20Poly1305::new_from_slice(&candidates[i].1) {
+                    Ok(c) => c,
+                    Err(_) => continue,
+                };
+                let mut nonce = [0u8; 12];
+                nonce[4..].copy_from_slice(&nonces[i].to_le_bytes());
+                if let Ok(pt) = cipher.decrypt(
+                    (&nonce).into(),
+                    Payload {
+                        msg: &ct,
+                        aad: &aad,
+                    },
+                ) {
+                    if chosen.is_none() {
+                        crate::dlog!("[event] answering receiver /command keepalives (key {})", candidates[i].0);
+                        chosen = Some(i);
+                    }
+                    nonces[i] += 1;
+                    req.extend_from_slice(&pt);
+                    // Respond to each complete RTSP request in `req`.
+                    while let Some((cseq, consumed)) = parse_rtsp_request(&req) {
+                        crate::dlog!(
+                            "[event] >>> {}",
+                            String::from_utf8_lossy(&req[..consumed.min(80)])
+                                .lines()
+                                .next()
+                                .unwrap_or("")
+                        );
+                        let body = format!("RTSP/1.0 200 OK\r\nCSeq: {cseq}\r\nContent-Length: 0\r\n\r\n");
+                        let mut frame = (body.len() as u16).to_le_bytes().to_vec();
+                        let aad2 = (body.len() as u16).to_le_bytes();
+                        let mut n2 = [0u8; 12];
+                        n2[4..].copy_from_slice(&resp_nonce.to_le_bytes());
+                        if let Ok(cph) = ChaCha20Poly1305::new_from_slice(&resp_key) {
+                            if let Ok(sealed) = cph.encrypt(
+                                (&n2).into(),
+                                Payload {
+                                    msg: body.as_bytes(),
+                                    aad: &aad2,
+                                },
+                            ) {
+                                frame.extend_from_slice(&sealed);
+                                let _ = conn.write_all(&frame);
+                                resp_nonce += 1;
+                                crate::dlog!("[event] <<< RTSP/1.0 200 OK (CSeq {cseq})");
+                            }
+                        }
+                        req.drain(..consumed);
+                    }
+                    ok = true;
+                    break;
+                }
+            }
+            if !ok {
+                if chosen.is_none() {
+                    crate::dlog!(
+                        "[event] no candidate key decrypted frame (len={len}); ct: {}",
+                        hx(&ct[..ct.len().min(48)])
+                    );
+                }
+                return;
+            }
+            buf.drain(..2 + len + 16);
+        }
+    }
+}
+
 fn stream_frames(
     capture: &mut dyn FrameSource,
     data: &Arc<Mutex<DataChannel>>,
@@ -2005,6 +2252,9 @@ fn stream_frames(
                 pending_keyframe = false;
                 codec_sent = false;
                 frame_count += 1;
+                if frame_count <= 5 || frame_count % 150 == 0 {
+                    crate::dlog!("[mirror] sent video frame {frame_count} (len={sent_len})");
+                }
                 Ok(())
             })();
             res
@@ -2188,7 +2438,8 @@ fn ntp_timing_responder(sock: std::net::UdpSocket, stop: Arc<AtomicBool>) {
         // Receive + Transmit timestamps = now (BE).
         reply[16..24].copy_from_slice(&now.to_be_bytes());
         reply[24..32].copy_from_slice(&now.to_be_bytes());
-        let _ = sock.send_to(&reply, addr);
+        let r = sock.send_to(&reply, addr);
+        crate::dlog!("[NTP] probe from {addr} ({n} bytes) -> reply {:?}", r.is_ok());
     }
 }
 
@@ -2239,12 +2490,6 @@ fn now_unix_nanos() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos() as u64)
         .unwrap_or(0)
-}
-
-/// Install a SIGINT (Ctrl-C) handler that flips the stop flag. Best-effort:
-/// errors (e.g. a handler already set) are ignored.
-fn ctrlc_set<F: Fn() + Send + 'static>(f: F) -> Result<()> {
-    ctrlc::set_handler(f).map_err(|e| anyhow!("set ctrl-c handler: {e}"))
 }
 
 #[cfg(test)]

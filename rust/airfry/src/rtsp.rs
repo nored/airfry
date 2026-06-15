@@ -131,6 +131,14 @@ impl Transport {
         buf.extend_from_slice(b"\r\n");
         buf.extend_from_slice(body);
 
+        crate::dlog!(
+            "[HTTP] -> {method} {path} (body={} bytes, enc={}, cseq={}) body={}",
+            body.len(),
+            self.encrypted,
+            seq,
+            hexdump(body)
+        );
+
         let data = if self.encrypted {
             self.encrypt(&buf)?
         } else {
@@ -141,7 +149,17 @@ impl Transport {
             .write_all(&data)
             .context("write request to socket")?;
 
-        self.read_response()
+        let resp = self.read_response();
+        match &resp {
+            Ok(r) => crate::dlog!(
+                "[HTTP] <- {} {path} ({} body bytes) body={}",
+                r.status,
+                r.body.len(),
+                hexdump(&r.body)
+            ),
+            Err(e) => crate::dlog!("[HTTP] <- {path} ERROR: {e:#}"),
+        }
+        resp
     }
 
     /// Send a bare RTSP/1.0 request without HAP encryption and without
@@ -346,6 +364,20 @@ fn finish_response(
         headers,
         body,
     })
+}
+
+/// Hex-encode a body for debug logging (truncated so large plists stay readable).
+fn hexdump(b: &[u8]) -> String {
+    const MAX: usize = 1024;
+    let shown = &b[..b.len().min(MAX)];
+    let mut s = String::with_capacity(shown.len() * 2 + 8);
+    for byte in shown {
+        s.push_str(&format!("{byte:02x}"));
+    }
+    if b.len() > MAX {
+        s.push_str(&format!("…(+{} bytes)", b.len() - MAX));
+    }
+    s
 }
 
 /// Parse an RTSP/HTTP response header block. Returns (status, content_length,
@@ -652,7 +684,8 @@ impl Session {
                         &format!("saved-creds pair-verify failed ({e}); falling back to transient pairing"),
                     );
                     // The failed pair-verify may have dirtied/closed the socket;
-                    // reconnect + GetInfo before the transient attempt (main.go:174-180).
+                    // reconnect + GetInfo, then go straight to PIN-display pairing
+                    // (no transient — it would only arm the receiver backoff).
                     drop(transport);
                     let mut t = Transport::connect(host, port)
                         .context("reconnect after saved-creds pair-verify")?;
@@ -660,12 +693,9 @@ impl Session {
                     if i.pk.is_empty() && !mdns_pk.is_empty() {
                         i.pk = mdns_pk.to_vec();
                     }
-                    let (t, i, keys) = cascade_transient_then_pin(
+                    let (t, i, keys) = pair_pin_display(
                         t,
                         i,
-                        host,
-                        port,
-                        mdns_pk,
                         device_id,
                         &pairing_id,
                         reuse_seed,
@@ -679,14 +709,15 @@ impl Session {
                 }
             }
         } else {
-            // (3) Transient pairing (no saved creds, no PIN), falling back to
-            // a PIN prompt + fresh-reconnect PIN pairing (main.go:204-228).
-            let (t, i, keys) = cascade_transient_then_pin(
+            // (3) No saved creds, no explicit PIN. Go STRAIGHT to the PIN-display
+            // flow — do NOT lead with a transient attempt. On receivers that
+            // require the on-screen code, transient fails SRP auth and arms the
+            // backoff that then blocks the PIN (see pair_pin_display). One PIN
+            // pairing now saves credentials, so every later connect is the
+            // instant pair-verify fast path (no PIN).
+            let (t, i, keys) = pair_pin_display(
                 transport,
                 info,
-                host,
-                port,
-                mdns_pk,
                 device_id,
                 &pairing_id,
                 reuse_seed,
@@ -766,6 +797,7 @@ impl Session {
 /// and the pairing keys so the caller can continue with fp-setup on the live
 /// socket.
 #[allow(clippy::too_many_arguments)]
+#[allow(dead_code)] // kept for reference; the live flow uses pair_pin_display
 fn cascade_transient_then_pin(
     mut transport: Transport,
     mut info: ReceiverInfo,
@@ -785,7 +817,7 @@ fn cascade_transient_then_pin(
             progress(
                 "pair-setup",
                 false,
-                &format!("transient failed ({e}); receiver requires a pairing code"),
+                &format!("transient failed ({e:#}); receiver requires a pairing code"),
             );
             // Ask the receiver to show its PIN (best effort on this conn).
             let _ = pairing::pair_pin_start(&mut transport);
@@ -799,9 +831,41 @@ fn cascade_transient_then_pin(
                 }
             };
             progress("pin", true, "got pairing code; reconnecting");
-            // Reconnect on a FRESH socket — the failed attempt dirtied it.
+            // Reconnect on a FRESH socket — the failed attempt dirtied it
+            // (doubletake main.go:184-193 reconnects here too). The Apple TV is
+            // often briefly unreachable right after pair-pin-start (it re-inits
+            // its listener for pairing → connect can fail with EHOSTUNREACH), so
+            // retry with backoff instead of giving up on the first failure.
             drop(transport);
-            let mut t2 = Transport::connect(host, port).context("reconnect for PIN pairing")?;
+            let mut t2 = {
+                let mut conn = None;
+                let mut last_err = None;
+                for attempt in 1..=12 {
+                    match Transport::connect(host, port) {
+                        Ok(t) => {
+                            conn = Some(t);
+                            break;
+                        }
+                        Err(e) => {
+                            progress(
+                                "reconnect",
+                                false,
+                                &format!("attempt {attempt} failed ({e}); retrying"),
+                            );
+                            last_err = Some(e);
+                            std::thread::sleep(std::time::Duration::from_millis(600));
+                        }
+                    }
+                }
+                match conn {
+                    Some(t) => t,
+                    None => {
+                        return Err(last_err
+                            .unwrap_or_else(|| anyhow::anyhow!("connect failed"))
+                            .context("reconnect for PIN pairing"))
+                    }
+                }
+            };
             let mut info2 = info::get_info(&mut t2).unwrap_or_default();
             if info2.pk.is_empty() && !mdns_pk.is_empty() {
                 info2.pk = mdns_pk.to_vec();
@@ -814,6 +878,43 @@ fn cascade_transient_then_pin(
             Ok((t2, info2, keys))
         }
     }
+}
+
+/// Clean PIN-display pairing on a SINGLE connection: ask the receiver to show
+/// its code, prompt for it, then run the PIN pair-setup + pair-verify — with NO
+/// transient attempt and NO reconnect.
+///
+/// Why skip transient: on receivers that require the on-screen code, a transient
+/// (PIN-less) pair-setup fails SRP auth (M4 error 2). That failed authentication
+/// arms the receiver's escalating anti-brute-force backoff, which then rejects
+/// the PIN pair-setup that follows with M2 error 3 — so leading with a doomed
+/// transient attempt poisons the very PIN attempt we need. (doubletake hits the
+/// exact same wall when it has no saved credentials.) Leading straight with the
+/// PIN keeps the connection clean and never trips the backoff.
+fn pair_pin_display(
+    mut transport: Transport,
+    mut info: ReceiverInfo,
+    device_id: &str,
+    pairing_id: &str,
+    reuse_seed: Option<[u8; 32]>,
+    cred_store: &mut CredentialStore,
+    pin_provider: &mut dyn FnMut() -> Option<String>,
+    progress: &mut dyn FnMut(&str, bool, &str),
+) -> Result<(Transport, ReceiverInfo, PairKeys)> {
+    // Ask the receiver to display its pairing code (best-effort).
+    let _ = pairing::pair_pin_start(&mut transport);
+    progress("pin", true, "asked the receiver to show its pairing code");
+    let code = match pin_provider() {
+        Some(p) if !p.trim().is_empty() => p.trim().to_string(),
+        _ => bail!("pairing requires the code shown on the receiver, but none was provided"),
+    };
+    progress("pin", true, "got pairing code; running PIN pair-setup");
+    // PIN pair-setup + pair-verify on this same clean connection.
+    let keys = do_pairing(&mut transport, &mut info, &code, pairing_id, reuse_seed, progress)?;
+    let _ = cred_store
+        .save(device_id, pairing_id, &keys.ed25519_public, &keys.ed25519_seed)
+        .map(|_| progress("credentials", true, "saved pairing identity"));
+    Ok((transport, info, keys))
 }
 
 /// Run one pairing attempt on `transport` and return the resulting `PairKeys`

@@ -29,6 +29,7 @@
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
 use gstreamer as gst;
@@ -53,6 +54,10 @@ pub struct CaptureConfig {
     /// into the centre by this percent and pads black, to counter Apple TVs
     /// that overscan/zoom. Clamped to 25 like capture.go.
     pub fit_pct: u8,
+    /// Keep the videoscale+videobox fit stage in the pipeline ALWAYS (even at
+    /// 0 %), so underscan can be adjusted LIVE mid-stream without rebuilding the
+    /// pipeline (and without re-prompting the portal). See `CaptureSource::live_fit`.
+    pub live_underscan: bool,
     /// Force the software encoder (x264enc). Useful where VA-API is absent.
     pub force_software: bool,
     /// Use the synthetic videotestsrc pipeline (main.go -test / capture.go
@@ -89,6 +94,7 @@ impl Default for CaptureConfig {
             fps: 30,
             bitrate_kbps: 0,
             fit_pct: 0,
+            live_underscan: false,
             force_software: false,
             test: false,
             restore_token: None,
@@ -170,6 +176,9 @@ pub struct CaptureSource {
     /// pipeline's lifetime (Wayland only).
     _portal: Option<PortalSession>,
     eos: Arc<Mutex<bool>>,
+    /// Live underscan handle (Some when the fit stage is present). Cloned out via
+    /// `live_fit()` so the tray can retune the border mid-stream.
+    live_fit: Option<LiveFit>,
 }
 
 impl CaptureSource {
@@ -196,28 +205,28 @@ impl CaptureSource {
     /// profile, Annex-B byte-stream. Runs with no display/portal. Built in-process
     /// with the same element graph the Go code passes to gst-launch-1.0.
     fn start_test(cfg: &CaptureConfig) -> Result<CaptureSource> {
+        Self::start_test_enc(cfg, false)
+    }
+
+    /// Synthetic videotestsrc capture, but through the REAL encoder selection
+    /// (build_encoder) + the no-frames fallback — so `--test` actually exercises
+    /// hardware encoding (NVENC/VA-API) on whatever machine it runs on, and
+    /// verifies the fallback to software. `force_software` is the fallback retry.
+    fn start_test_enc(cfg: &CaptureConfig, force_software: bool) -> Result<CaptureSource> {
         let fps = if cfg.fps == 0 { 30 } else { cfg.fps };
-        // captureBitrateKbps over the fixed test dims (capture.go:496).
         let scale = OutputScale {
             enc_w: TEST_CAPTURE_WIDTH,
             enc_h: TEST_CAPTURE_HEIGHT,
             scale_args: None,
         };
-        let bitrate = capture_bitrate_kbps(cfg, &scale, fps);
-        let key_int = keyframe_interval_frames(fps);
-
-        eprintln!("[CAPTURE] test mode: videotestsrc pattern=18 ! timeoverlay ! x264enc (bitrate={bitrate} kbps)");
 
         let pipeline = gst::Pipeline::new();
-
-        // videotestsrc pattern=18 (ball) is-live=true do-timestamp=true.
         let src = gst::ElementFactory::make("videotestsrc")
             .property_from_str("pattern", "ball")
             .property("is-live", true)
             .property("do-timestamp", true)
             .build()
             .context("create videotestsrc")?;
-        // video/x-raw,width,height,framerate.
         let src_caps = gst::ElementFactory::make("capsfilter")
             .property(
                 "caps",
@@ -231,64 +240,29 @@ impl CaptureSource {
             .context("create test src capsfilter")?;
         let timeoverlay = make("timeoverlay")?;
         let videoconvert = make("videoconvert")?;
-        // x264enc tune=zerolatency speed-preset=superfast bitrate key-int-max
-        // threads=1 sliced-threads=true byte-stream=true (capture.go:508-515).
-        let enc = gst::ElementFactory::make("x264enc")
-            .property_from_str("tune", "zerolatency")
-            .property_from_str("speed-preset", "superfast")
-            .property("bitrate", bitrate)
-            .property("key-int-max", key_int)
-            .property("threads", 1u32)
-            .property("sliced-threads", true)
-            .property("byte-stream", true)
-            .build()
-            .context("create x264enc (install gst-plugins-ugly / libx264)")?;
-        // video/x-h264,profile=high,stream-format=byte-stream (capture.go:516).
-        let enc_caps = gst::ElementFactory::make("capsfilter")
-            .property(
-                "caps",
-                &gst::Caps::builder("video/x-h264")
-                    .field("profile", "high")
-                    .field("stream-format", "byte-stream")
-                    .build(),
-            )
-            .build()
-            .context("create test h264 capsfilter")?;
+        let mut elems: Vec<gst::Element> = vec![src, src_caps, timeoverlay, videoconvert];
 
-        let appsink = gst_app::AppSink::builder()
-            .sync(false)
-            .max_buffers(8)
-            .drop(false)
-            .build();
-
-        let elems: Vec<gst::Element> = vec![
-            src,
-            src_caps,
-            timeoverlay,
-            videoconvert,
-            enc,
-            enc_caps,
-            appsink.upcast_ref::<gst::Element>().clone(),
-        ];
-        for e in elems.iter() {
-            pipeline.add(e).context("add test element")?;
-        }
-        gst::Element::link_many(elems.iter().collect::<Vec<_>>().as_slice())
-            .context("link test pipeline")?;
-
-        let (rx, eos) = wire_appsink(&appsink);
-
+        let (enc, eos, rx, live_fit) =
+            Self::finish_pipeline(cfg, &pipeline, &mut elems, &scale, fps, force_software)?;
+        let _ = enc;
         pipeline
             .set_state(gst::State::Playing)
             .context("set test pipeline PLAYING")?;
 
-        Ok(CaptureSource {
+        let mut cap = CaptureSource {
             pipeline,
             rx,
             leftover: Vec::new(),
             _portal: None,
             eos,
-        })
+            live_fit,
+        };
+        if !force_software && !cap.probe_first_frame(Duration::from_secs(3)) {
+            crate::dlog!("[capture] hardware encoder produced no frames in 3s; falling back to software (x264)");
+            cap.stop();
+            return Self::start_test_enc(cfg, true);
+        }
+        Ok(cap)
     }
 
     fn start_wayland(cfg: &CaptureConfig) -> Result<CaptureSource> {
@@ -304,7 +278,7 @@ impl CaptureSource {
             }
         }
         let (src_w, src_h) = portal.size;
-        eprintln!(
+        crate::dlog!(
             "[capture] portal node={} size={}x{}",
             portal.node_id, src_w, src_h
         );
@@ -357,7 +331,7 @@ impl CaptureSource {
             queue.clone(),
         ];
 
-        let (enc, eos, rx) = Self::finish_pipeline(
+        let (enc, eos, rx, live_fit) = Self::finish_pipeline(
             cfg, &pipeline, &mut elems, scale, fps, force_software,
         )?;
         let _ = enc;
@@ -366,13 +340,25 @@ impl CaptureSource {
             .set_state(gst::State::Playing)
             .context("set pipeline PLAYING")?;
 
-        Ok(CaptureSource {
+        let mut cap = CaptureSource {
             pipeline,
             rx,
             leftover: Vec::new(),
             _portal: Some(portal),
             eos,
-        })
+            live_fit,
+        };
+        // No-frames fallback: if a hardware encoder builds but emits nothing,
+        // reclaim the portal, tear it down, and rebuild with software (x264).
+        if !force_software && !cap.probe_first_frame(Duration::from_secs(3)) {
+            crate::dlog!("[capture] hardware encoder produced no frames in 3s; falling back to software (x264)");
+            let portal = cap._portal.take();
+            cap.stop();
+            if let Some(portal) = portal {
+                return Self::build_wayland_pipeline(cfg, portal, scale, true);
+            }
+        }
+        Ok(cap)
     }
 
     fn start_x11(cfg: &CaptureConfig) -> Result<CaptureSource> {
@@ -417,7 +403,7 @@ impl CaptureSource {
                 .property("starty", start_y as u32)
                 .property("endx", (end_x - 1) as u32)
                 .property("endy", (end_y - 1) as u32);
-            eprintln!(
+            crate::dlog!(
                 "[capture] cropping ximagesrc to x={}..{} y={}..{}",
                 start_x,
                 end_x - 1,
@@ -444,7 +430,7 @@ impl CaptureSource {
             videoconvert.clone(),
         ];
 
-        let (enc, eos, rx) = Self::finish_pipeline(
+        let (enc, eos, rx, live_fit) = Self::finish_pipeline(
             cfg, &pipeline, &mut elems, scale, fps, force_software,
         )?;
 
@@ -453,17 +439,30 @@ impl CaptureSource {
         let needs_vulkan = enc.factory().map(|f| f.name() == "vulkanh264enc").unwrap_or(false);
         let started = pipeline.set_state(gst::State::Playing);
         match started {
-            Ok(_) => Ok(CaptureSource {
-                pipeline,
-                rx,
-                leftover: Vec::new(),
-                _portal: None,
-                eos,
-            }),
+            Ok(_) => {
+                let mut cap = CaptureSource {
+                    pipeline,
+                    rx,
+                    leftover: Vec::new(),
+                    _portal: None,
+                    eos,
+                    live_fit,
+                };
+                // No-frames fallback (e.g. a hardware encoder that builds but
+                // emits nothing): rebuild with software.
+                if !force_software && !cap.probe_first_frame(Duration::from_secs(3)) {
+                    crate::dlog!("[capture] hardware encoder produced no frames in 3s; falling back to software (x264)");
+                    cap.stop();
+                    return Self::build_x11_pipeline(
+                        cfg, display, start_x, start_y, end_x, end_y, scale, true,
+                    );
+                }
+                Ok(cap)
+            }
             Err(e) => {
                 let _ = pipeline.set_state(gst::State::Null);
                 if needs_vulkan && !force_software {
-                    eprintln!("[capture] vulkanh264enc pipeline failed, falling back to x264enc");
+                    crate::dlog!("[capture] vulkanh264enc pipeline failed, falling back to x264enc");
                     Self::build_x11_pipeline(
                         cfg, display, start_x, start_y, end_x, end_y, scale, true,
                     )
@@ -486,10 +485,18 @@ impl CaptureSource {
         scale: &OutputScale,
         fps: u32,
         force_software: bool,
-    ) -> Result<(gst::Element, Arc<Mutex<bool>>, Receiver<Vec<u8>>)> {
-        // Optional output-scale stage (videoscale [+ videobox]) — applies the
-        // OUTPUT_HEIGHT rescale and/or the fit/underscan border.
-        elems.extend(build_output_scale_stage(scale)?);
+    ) -> Result<(
+        gst::Element,
+        Arc<Mutex<bool>>,
+        Receiver<Vec<u8>>,
+        Option<LiveFit>,
+    )> {
+        // Optional output-scale stage (videoscale [+ videobox], or an opt-in
+        // compositor) — applies the OUTPUT_HEIGHT rescale and/or the fit/underscan
+        // border. The handle lets underscan be retuned mid-stream; the compositor
+        // variant's pad is resolved after link_many (below).
+        let (scale_elems, fit_handle) = build_output_scale_stage(scale, fps)?;
+        elems.extend(scale_elems);
 
         let (encoder, needs_vulkan) = build_encoder(cfg, scale, fps, force_software)?;
         if needs_vulkan {
@@ -528,9 +535,48 @@ impl CaptureSource {
         gst::Element::link_many(elems.iter().collect::<Vec<_>>().as_slice())
             .context("link pipeline")?;
 
+        // Resolve the live underscan handle. The compositor's request sink pad
+        // only exists after linking; set its initial geometry now.
+        let live_fit = match fit_handle {
+            FitHandle::None => None,
+            FitHandle::Ready(lf) => Some(lf),
+            FitHandle::PendingCompositor(p) => {
+                let pad = p
+                    .compositor
+                    .sink_pads()
+                    .into_iter()
+                    .next()
+                    .ok_or_else(|| anyhow!("compositor has no sink pad after linking"))?;
+                let (xpos, ypos, w, h) = p.init;
+                pad.set_property("xpos", xpos);
+                pad.set_property("ypos", ypos);
+                pad.set_property("width", w);
+                pad.set_property("height", h);
+                Some(LiveFit::Compositor {
+                    pad,
+                    tw: p.tw,
+                    th: p.th,
+                })
+            }
+        };
+
         let (rx, eos) = wire_appsink(&appsink);
 
-        Ok((encoder, eos, rx))
+        Ok((encoder, eos, rx, live_fit))
+    }
+
+    /// Wait up to `timeout` for the FIRST encoded chunk and stash it (so `read`
+    /// returns it later). Returns true if a frame arrived. A hardware encoder
+    /// that builds but emits nothing (e.g. vulkanh264enc on some NVIDIA stacks,
+    /// or a broken VA-API driver) returns false here so the caller can fall back.
+    fn probe_first_frame(&mut self, timeout: Duration) -> bool {
+        match self.rx.recv_timeout(timeout) {
+            Ok(chunk) => {
+                self.leftover = chunk;
+                true
+            }
+            Err(_) => false,
+        }
     }
 
     /// Fill `buf` with the next chunk of the Annex-B H.264 byte-stream, the
@@ -560,6 +606,12 @@ impl CaptureSource {
 
     pub fn stop(&self) {
         let _ = self.pipeline.set_state(gst::State::Null);
+    }
+
+    /// A handle to retune underscan live, or None if this capture has no fit
+    /// stage (e.g. `--test`, or `live_underscan` was not requested).
+    pub fn live_fit(&self) -> Option<LiveFit> {
+        self.live_fit.clone()
     }
 
     /// A detached, cloneable stop handle for this capture's GStreamer pipeline.
@@ -748,25 +800,31 @@ impl OutputScale {
         let enc_h = th;
 
         let mut fit = fit_pct_env(cfg);
+        if fit < 0 {
+            fit = 0;
+        }
+        if fit > 25 {
+            fit = 25;
+        }
         let scaled = tw != src_w || th != src_h;
 
-        if fit <= 0 && !scaled {
-            // native passthrough — nothing to do.
+        // With live underscan we ALWAYS keep the videoscale+videobox stage (even
+        // at 0 %, an identity transform) so the border can be retuned mid-stream
+        // without rebuilding the pipeline. Otherwise preserve the lean Go
+        // behaviour: passthrough / plain-rescale when there's no fit border.
+        if fit == 0 && !scaled && !cfg.live_underscan {
             return OutputScale {
                 enc_w,
                 enc_h,
                 scale_args: None,
             };
         }
-        if fit <= 0 {
+        if fit == 0 && !cfg.live_underscan {
             return OutputScale {
                 enc_w,
                 enc_h,
                 scale_args: Some(ScaleArgs::Plain { w: tw, h: th }),
             };
-        }
-        if fit > 25 {
-            fit = 25;
         }
         let mut cw = tw * (100 - fit) / 100;
         let mut ch = th * (100 - fit) / 100;
@@ -774,7 +832,7 @@ impl OutputScale {
         ch -= ch % 2;
         let bx = (tw - cw) / 2;
         let by = (th - ch) / 2;
-        eprintln!(
+        crate::dlog!(
             "[capture] fit {fit}%: desktop {cw}x{ch} centered in {tw}x{th} frame (border {bx}/{by})"
         );
         OutputScale {
@@ -805,13 +863,123 @@ fn raw_caps(w: i32, h: i32) -> Result<gst::Element> {
         .context("create video/x-raw capsfilter")
 }
 
-/// build_output_scale_stage — turn an OutputScale into the videoscale (+ videobox)
-/// element chain, the in-process analogue of outputScaleArgs.
-fn build_output_scale_stage(scale: &OutputScale) -> Result<Vec<gst::Element>> {
+/// Whether to use the compositor underscan path. DEFAULT ON (verified on
+/// hardware to retune underscan smoothly — changing the compositor sink-pad
+/// geometry does NOT renegotiate caps, so the receiver no longer freezes/
+/// re-buffers when the size changes). Set `AIRFRY_LEGACY_UNDERSCAN=1` to fall
+/// back to the old videoscale+videobox path (which froze the receiver on change).
+fn use_compositor_fit() -> bool {
+    !std::env::var_os("AIRFRY_LEGACY_UNDERSCAN").is_some_and(|v| v != "0" && !v.is_empty())
+}
+
+/// A handle to the live-adjustable underscan stage of a running pipeline. Two
+/// implementations: the default `ScaleBox` (videoscale caps + videobox border —
+/// the original working path) and the opt-in `Compositor` (sink-pad geometry, no
+/// caps renegotiation). Cloneable GObject handles, `Send`/`Sync`.
+#[derive(Clone)]
+pub enum LiveFit {
+    ScaleBox {
+        scale_caps: gst::Element,
+        videobox: gst::Element,
+        tw: i32,
+        th: i32,
+    },
+    Compositor {
+        pad: gst::Pad,
+        tw: i32,
+        th: i32,
+    },
+}
+
+impl LiveFit {
+    /// Apply an underscan percent (0..=25) to the running pipeline immediately.
+    pub fn apply(&self, pct: u8) {
+        match self {
+            LiveFit::ScaleBox {
+                scale_caps,
+                videobox,
+                tw,
+                th,
+            } => {
+                let (bx, by, cw, ch) = fit_geometry(*tw, *th, pct);
+                // NOTE: changing the videoscale caps renegotiates downstream,
+                // which can stall the stream — this is the path the compositor
+                // variant avoids.
+                let caps = gst::Caps::builder("video/x-raw")
+                    .field("width", cw)
+                    .field("height", ch)
+                    .build();
+                scale_caps.set_property("caps", &caps);
+                videobox.set_property("left", -bx);
+                videobox.set_property("right", -bx);
+                videobox.set_property("top", -by);
+                videobox.set_property("bottom", -by);
+                crate::dlog!(
+                    "[capture] LIVE underscan {}% (scalebox): {cw}x{ch} centered in {tw}x{th} (border {bx}/{by})",
+                    pct.min(25)
+                );
+            }
+            LiveFit::Compositor { pad, tw, th } => {
+                let (xpos, ypos, w, h) = fit_geometry(*tw, *th, pct);
+                pad.set_property("xpos", xpos);
+                pad.set_property("ypos", ypos);
+                pad.set_property("width", w);
+                pad.set_property("height", h);
+                crate::dlog!(
+                    "[capture] LIVE underscan {}% (compositor): {w}x{h} at ({xpos},{ypos}) in {tw}x{th}",
+                    pct.min(25)
+                );
+            }
+        }
+    }
+}
+
+/// Centered underscan geometry → (border_x, border_y, content_w, content_h).
+fn fit_geometry(tw: i32, th: i32, pct: u8) -> (i32, i32, i32, i32) {
+    let fit = (pct.min(25)) as i32;
+    let mut cw = tw * (100 - fit) / 100;
+    let mut ch = th * (100 - fit) / 100;
+    cw -= cw % 2;
+    ch -= ch % 2;
+    if cw < 2 {
+        cw = 2;
+    }
+    if ch < 2 {
+        ch = 2;
+    }
+    let bx = (tw - cw) / 2;
+    let by = (th - ch) / 2;
+    (bx, by, cw, ch)
+}
+
+/// A compositor whose request sink pad becomes a `LiveFit::Compositor` once
+/// linked (the pad only exists after `link_many`).
+struct PendingFit {
+    compositor: gst::Element,
+    tw: i32,
+    th: i32,
+    init: (i32, i32, i32, i32),
+}
+
+/// The fit stage's live handle: ready (videobox path), or pending pad resolution
+/// (compositor path), or none.
+enum FitHandle {
+    None,
+    Ready(LiveFit),
+    PendingCompositor(PendingFit),
+}
+
+/// build_output_scale_stage — turn an OutputScale into the scaling element chain.
+/// `Fit`/underscan uses videoscale+videobox by default, or a `compositor` when
+/// `AIRFRY_LIVE_COMPOSITOR` is set (returns a pending handle to resolve the pad).
+fn build_output_scale_stage(
+    scale: &OutputScale,
+    fps: u32,
+) -> Result<(Vec<gst::Element>, FitHandle)> {
     match &scale.scale_args {
-        None => Ok(Vec::new()),
+        None => Ok((Vec::new(), FitHandle::None)),
         Some(ScaleArgs::Plain { w, h }) => {
-            Ok(vec![make("videoscale")?, raw_caps(*w, *h)?])
+            Ok((vec![make("videoscale")?, raw_caps(*w, *h)?], FitHandle::None))
         }
         Some(ScaleArgs::Fit {
             cw,
@@ -821,6 +989,36 @@ fn build_output_scale_stage(scale: &OutputScale) -> Result<Vec<gst::Element>> {
             bx,
             by,
         }) => {
+            if use_compositor_fit() {
+                // OPT-IN: scale via a compositor pad over a black canvas. Pad
+                // geometry is live-changeable WITHOUT a caps renegotiation, so
+                // underscan retunes smoothly with no receiver re-buffer.
+                let compositor = gst::ElementFactory::make("compositor")
+                    .property_from_str("background", "black")
+                    .build()
+                    .context("create compositor (install gst-plugins-base)")?;
+                let out_caps = gst::ElementFactory::make("capsfilter")
+                    .property(
+                        "caps",
+                        &gst::Caps::builder("video/x-raw")
+                            .field("width", *tw)
+                            .field("height", *th)
+                            .field("framerate", gst::Fraction::new(fps as i32, 1))
+                            .field("pixel-aspect-ratio", gst::Fraction::new(1, 1))
+                            .build(),
+                    )
+                    .build()
+                    .context("create compositor out caps")?;
+                let pending = PendingFit {
+                    compositor: compositor.clone(),
+                    tw: *tw,
+                    th: *th,
+                    init: (*bx, *by, *cw, *ch),
+                };
+                return Ok((vec![compositor, out_caps], FitHandle::PendingCompositor(pending)));
+            }
+
+            // DEFAULT (unchanged working path): videoscale ! caps ! videobox.
             let videoscale = make("videoscale")?;
             let scale_caps = raw_caps(*cw, *ch)?;
             // videobox with negative borders pads (adds) pixels; matches
@@ -835,7 +1033,16 @@ fn build_output_scale_stage(scale: &OutputScale) -> Result<Vec<gst::Element>> {
                 .build()
                 .context("create videobox")?;
             let box_caps = raw_caps(*tw, *th)?;
-            Ok(vec![videoscale, scale_caps, videobox, box_caps])
+            let live = LiveFit::ScaleBox {
+                scale_caps: scale_caps.clone(),
+                videobox: videobox.clone(),
+                tw: *tw,
+                th: *th,
+            };
+            Ok((
+                vec![videoscale, scale_caps, videobox, box_caps],
+                FitHandle::Ready(live),
+            ))
         }
     }
 }
@@ -851,7 +1058,7 @@ fn capture_bitrate_kbps(cfg: &CaptureConfig, scale: &OutputScale, fps: u32) -> u
         (1920, 1080)
     };
     let b = recommended_bitrate_kbps(w, h, fps);
-    eprintln!("[capture] auto bitrate selected: {b} kbps for {w}x{h}@{fps}fps");
+    crate::dlog!("[capture] auto bitrate selected: {b} kbps for {w}x{h}@{fps}fps");
     b
 }
 
@@ -875,21 +1082,9 @@ fn build_encoder(
         hwaccel_mode(cfg)
     };
 
-    // Try Vulkan H.264 (NVENC via Vulkan API).
-    if hwaccel == "auto" || hwaccel == "nvenc" {
-        if let Ok(enc) = gst::ElementFactory::make("vulkanh264enc")
-            .property("b-frames", 0u32)
-            .property("idr-period", key_int)
-            .property_from_str("rate-control", "cbr")
-            .property("bitrate", bitrate)
-            .build()
-        {
-            eprintln!("[CAPTURE] using NVENC hardware encoding (vulkanh264enc)");
-            return Ok((enc, true));
-        }
-    }
-
-    // Try legacy NVENC.
+    // Try NVENC (nvh264enc) FIRST — the real NVIDIA encoder. (vulkanh264enc was
+    // the old default but BUILDS yet produces ZERO frames on this hardware → black
+    // screen, so it's now opt-in only via hwaccel="vulkan".)
     if hwaccel == "auto" || hwaccel == "nvenc" {
         if let Ok(enc) = gst::ElementFactory::make("nvh264enc")
             .property("bitrate", bitrate)
@@ -900,11 +1095,25 @@ fn build_encoder(
             .property("zerolatency", true)
             .build()
         {
-            eprintln!("[CAPTURE] using NVENC hardware encoding (nvh264enc)");
+            crate::dlog!("[CAPTURE] using NVENC hardware encoding (nvh264enc)");
             return Ok((enc, false));
         }
         if hwaccel == "nvenc" {
-            eprintln!("[CAPTURE] nvh264enc not available, falling back to software");
+            crate::dlog!("[CAPTURE] nvh264enc not available, falling back to software");
+        }
+    }
+
+    // Vulkan H.264 — opt-in only (it produces no frames on some NVIDIA setups).
+    if hwaccel == "vulkan" {
+        if let Ok(enc) = gst::ElementFactory::make("vulkanh264enc")
+            .property("b-frames", 0u32)
+            .property("idr-period", key_int)
+            .property_from_str("rate-control", "cbr")
+            .property("bitrate", bitrate)
+            .build()
+        {
+            crate::dlog!("[CAPTURE] using Vulkan hardware encoding (vulkanh264enc)");
+            return Ok((enc, true));
         }
     }
 
@@ -917,11 +1126,11 @@ fn build_encoder(
             .property_from_str("rate-control", "cbr")
             .build()
         {
-            eprintln!("[CAPTURE] using VAAPI hardware encoding (vah264enc)");
+            crate::dlog!("[CAPTURE] using VAAPI hardware encoding (vah264enc)");
             return Ok((enc, false));
         }
         if hwaccel == "vaapi" {
-            eprintln!("[CAPTURE] vah264enc not available, falling back to software");
+            crate::dlog!("[CAPTURE] vah264enc not available, falling back to software");
         }
     }
 
@@ -939,13 +1148,13 @@ fn build_encoder(
         // pass=0 and pass=cbr resolve to the same enum value.
         .property_from_str("pass", "cbr")
         .property("option-string", format!("vbv-maxrate={maxrate}"))
-        .property("b-frames", 0u32)
+        .property("bframes", 0u32) // GstX264Enc property is "bframes" (no hyphen)
         .property("sliced-threads", true)
         .property("byte-stream", true)
         .property("aud", true)
         .build()
         .context("create x264enc (install gst-plugins-ugly / libx264)")?;
-    eprintln!("[CAPTURE] using software encoding (x264enc) bitrate={bitrate} kbps");
+    crate::dlog!("[CAPTURE] using software encoding (x264enc) bitrate={bitrate} kbps");
     Ok((enc, false))
 }
 
@@ -961,7 +1170,7 @@ fn detect_primary_monitor(display: &str) -> (i32, i32, i32, i32) {
     let out = match out {
         Ok(o) if o.status.success() => o.stdout,
         _ => {
-            eprintln!("[capture] xrandr failed, skipping monitor crop");
+            crate::dlog!("[capture] xrandr failed, skipping monitor crop");
             return (0, 0, 0, 0);
         }
     };
@@ -995,11 +1204,11 @@ fn detect_primary_monitor(display: &str) -> (i32, i32, i32, i32) {
 
     match geom {
         Some((x, y, w, h)) if w > 0 && h > 0 => {
-            eprintln!("[capture] primary monitor: {w}x{h} at +{x}+{y}");
+            crate::dlog!("[capture] primary monitor: {w}x{h} at +{x}+{y}");
             (x, y, x + w, y + h)
         }
         _ => {
-            eprintln!("[capture] couldn't parse xrandr output, skipping monitor crop");
+            crate::dlog!("[capture] couldn't parse xrandr output, skipping monitor crop");
             (0, 0, 0, 0)
         }
     }
@@ -1079,41 +1288,65 @@ pub struct PortalSession {
 /// behavior. When no in-token is
 /// supplied this still requests persistence so the FIRST run produces a token to
 /// save.
+/// One process-wide Tokio runtime for all xdg-desktop-portal calls. ashpd keeps
+/// a cached D-Bus connection alive on whatever runtime first drove it; a
+/// per-call current-thread runtime would be dropped after the first request,
+/// killing that connection's reactor so the next portal request hangs. Keeping a
+/// single multi-thread runtime resident for the whole process avoids that.
+fn portal_runtime() -> &'static tokio::runtime::Runtime {
+    static RT: std::sync::OnceLock<tokio::runtime::Runtime> = std::sync::OnceLock::new();
+    RT.get_or_init(|| {
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("build persistent portal tokio runtime")
+    })
+}
+
 fn request_screencast(in_token: Option<&str>) -> Result<PortalSession> {
     use ashpd::desktop::screencast::{CursorMode, Screencast, SourceType};
     use ashpd::desktop::PersistMode;
     use ashpd::WindowIdentifier;
 
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .context("build tokio runtime for portal")?;
+    // ONE persistent runtime for the whole process. ashpd caches its D-Bus
+    // connection; if we built a fresh current-thread runtime per call and
+    // dropped it, the cached connection's reactor would die with the first
+    // runtime and the SECOND portal request (change-display / re-share) would
+    // hang forever at Start — exactly the "black screen on 2nd connect" bug.
+    let rt = portal_runtime();
 
     rt.block_on(async {
+        crate::dlog!("[capture] portal: connecting ScreenCast proxy…");
         let proxy = Screencast::new()
             .await
             .context("connect ScreenCast portal")?;
+        crate::dlog!("[capture] portal: creating session…");
         let session = proxy
             .create_session()
             .await
             .context("portal CreateSession")?;
+        crate::dlog!("[capture] portal: select_sources (picker about to show)…");
 
-        // MONITOR source, embedded cursor, single source. Request explicit
-        // persistence and replay any prior token so the grant is remembered
-        // across runs (capture.go restore-token flow).
-        let restore = in_token.filter(|t| !t.is_empty());
+        // MONITOR source, embedded cursor, single source. PersistMode::DoNot
+        // (and NO restore token) so GNOME prompts for the display on EVERY
+        // connect — matching the Go reference (capture.go forces persist 0). This
+        // is what makes "Change display" work: reconnecting re-shows the native
+        // screen picker instead of GNOME silently restoring the last screen.
+        let _ = in_token; // intentionally not replayed; we always want the picker
         proxy
             .select_sources(
                 &session,
                 CursorMode::Embedded,
                 SourceType::Monitor.into(),
                 false,
-                restore,
-                PersistMode::ExplicitlyRevoked,
+                None,
+                PersistMode::DoNot,
             )
             .await
             .context("portal SelectSources")?;
 
+        crate::dlog!("[capture] portal: Start (waiting for the user to pick a screen)…");
         let identifier = WindowIdentifier::default();
         let response = proxy
             .start(&session, &identifier)
@@ -1121,6 +1354,7 @@ fn request_screencast(in_token: Option<&str>) -> Result<PortalSession> {
             .context("portal Start")?
             .response()
             .context("portal Start response")?;
+        crate::dlog!("[capture] portal: Start returned (screen picked)");
 
         let restore_token = response.restore_token().map(|s| s.to_string());
 

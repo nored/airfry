@@ -56,10 +56,15 @@ keyring = { version = "3", features = ["sync-secret-service", "crypto-rust"] }
 
 # XDG ScreenCast portal (Wayland) + a tiny runtime to drive its async API
 ashpd = { version = "0.9", default-features = false, features = ["tokio"] }
-tokio = { version = "1", features = ["rt", "macros"] }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros"] }
 
 # clean Ctrl-C / SIGTERM handling for the mirror run loop + graceful shutdown
 ctrlc = { version = "3", features = ["termination"] }
 
-[build-dependencies]
-cc = "1"
+# Native StatusNotifierItem system tray (pure Rust, zbus backend → renders in
+# the GNOME/AppIndicator DBusMenu style, no Qt/C++). Vendored + patched to
+# surface the menu-open (AboutToShow) event so we scan only when the menu opens.
+# async-io backend (not tokio): a self-contained executor whose blocking
+# block_on is safe to call concurrently from our worker threads (the tray's
+# redraw/update path), independent of ashpd's tokio runtime.
+ksni = { path = "../../third_party/ksni", default-features = false, features = ["blocking", "async-io"] }

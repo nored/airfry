@@ -218,9 +218,17 @@ pub fn pair_setup_with_identity(
         (salt, server_pub)
     };
 
-    complete_srp_exchange(transport, pairing_id, pin, &salt, &server_pub, &mut keys)?;
+    // AirPlay-2 transient pairing authenticates SRP with the FIXED PIN "3939"
+    // (not an empty password — an empty password is rejected with M4 auth error
+    // 2, which then trips the receiver's escalating anti-brute-force backoff).
+    // The real on-screen code is used for the explicit PIN flow.
+    let srp_password = if pin.is_empty() { TRANSIENT_SRP_PIN } else { pin };
+    complete_srp_exchange(transport, pairing_id, srp_password, &salt, &server_pub, &mut keys)?;
     Ok(keys)
 }
+
+/// The hardcoded SRP password used by AirPlay-2 transient (PIN-less) pairing.
+const TRANSIENT_SRP_PIN: &str = "3939";
 
 /// Finish SRP from M3 onward (shared by transient + PIN flows). Sets
 /// `keys.shared_secret = K` on success (overwritten by pair-verify later).

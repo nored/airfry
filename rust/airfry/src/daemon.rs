@@ -211,7 +211,7 @@ impl Daemon {
         std::fs::set_permissions(&socket_path, std::fs::Permissions::from_mode(0o700))
             .context("chmod socket")?;
 
-        eprintln!("[daemon] listening on {}", socket_path.display());
+        crate::dlog!("[daemon] listening on {}", socket_path.display());
 
         // Background mDNS discovery.
         {
@@ -234,7 +234,7 @@ impl Daemon {
                     if self.shutdown.load(Ordering::Acquire) {
                         break;
                     }
-                    eprintln!("[daemon] accept error: {e}");
+                    crate::dlog!("[daemon] accept error: {e}");
                     continue;
                 }
             }
@@ -275,7 +275,7 @@ impl Daemon {
         const SCAN_DURATION: Duration = Duration::from_secs(5);
         const DEVICE_TTL: Duration = Duration::from_secs(30);
 
-        eprintln!("[daemon] starting continuous mDNS discovery");
+        crate::dlog!("[daemon] starting continuous mDNS discovery");
         loop {
             if self.shutdown.load(Ordering::Acquire) {
                 return;
@@ -323,7 +323,7 @@ impl Daemon {
                     inner.devices = devices;
                 }
                 Err(e) => {
-                    eprintln!("[daemon] mDNS browse error: {e}");
+                    crate::dlog!("[daemon] mDNS browse error: {e}");
                 }
             }
             drop(inner);
@@ -708,7 +708,7 @@ impl Daemon {
                 if let Some(entry) = inner.streams.get_mut(&target_for_pin) {
                     entry.pin_tx = Some(pin_tx.clone());
                 }
-                eprintln!(
+                crate::dlog!(
                     "[daemon] PIN required for {target_for_pin} — waiting for user input"
                 );
             }
@@ -721,7 +721,7 @@ impl Daemon {
 
         let mut report = |phase: &str, ok: bool, detail: &str| {
             let mark = if ok { "ok" } else { "FAIL" };
-            eprintln!("[daemon] [{mark}] {phase}: {detail}");
+            crate::dlog!("[daemon] [{mark}] {phase}: {detail}");
         };
 
         let session = match Session::connect_host_with(
@@ -734,7 +734,7 @@ impl Daemon {
         ) {
             Ok(s) => s,
             Err(e) => {
-                eprintln!("[daemon] connect to {target}:{port} failed: {e:#}");
+                crate::dlog!("[daemon] connect to {target}:{port} failed: {e:#}");
                 self.remove_stream(&target);
                 return;
             }
@@ -749,7 +749,7 @@ impl Daemon {
         let sink = match self.get_or_start_broadcast(&cfg) {
             Ok(sink) => sink,
             Err(e) => {
-                eprintln!("[daemon] capture failed for {target}: {e:#}");
+                crate::dlog!("[daemon] capture failed for {target}: {e:#}");
                 self.remove_stream(&target);
                 return;
             }
@@ -791,7 +791,7 @@ impl Daemon {
             }
         }
 
-        eprintln!("[daemon] streaming to {target}");
+        crate::dlog!("[daemon] streaming to {target}");
 
         // Build mirror options from config (daemon.go StreamConfig).
         let opts = MirrorOpts {
@@ -822,13 +822,13 @@ impl Daemon {
                 .map(|s| s.control.stop_flag().load(Ordering::Relaxed))
                 .unwrap_or(true)
             {
-                eprintln!("[daemon] stream error for {target}: {e:#}");
+                crate::dlog!("[daemon] stream error for {target}: {e:#}");
             }
         }
 
         // Cleanup this stream (daemon.go removeStreamLocked).
         self.remove_stream(&target);
-        eprintln!("[daemon] stream ended for {target}");
+        crate::dlog!("[daemon] stream ended for {target}");
     }
 
     /// Remove a single stream entry, stopping its worker, and tear down the
@@ -879,6 +879,7 @@ impl Daemon {
             fps: cfg.fps,
             bitrate_kbps: cfg.bitrate_kbps,
             fit_pct: 0,
+            live_underscan: false,
             force_software: cfg.force_software,
             test: cfg.test_mode,
             restore_token: None,
@@ -916,7 +917,7 @@ impl Daemon {
         thread::spawn(move || {
             if let Err(e) = bc_run.run() {
                 if e.to_string() != "EOF" {
-                    eprintln!("[daemon] broadcast capture error: {e:#}");
+                    crate::dlog!("[daemon] broadcast capture error: {e:#}");
                 }
             }
             let mut inner = me.inner.lock().unwrap();
@@ -1363,7 +1364,7 @@ mod tests {
         let sink1 = match daemon.get_or_start_broadcast(&cfg) {
             Ok(s) => s,
             Err(e) => {
-                eprintln!("skip shared_capture test: capture unavailable: {e:#}");
+                crate::dlog!("skip shared_capture test: capture unavailable: {e:#}");
                 return;
             }
         };

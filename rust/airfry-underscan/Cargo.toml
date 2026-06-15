@@ -1,0 +1,20 @@
+[package]
+name = "airfry-underscan"
+version = "0.1.0"
+edition = "2021"
+description = "AirFry underscan slider — a single-instance GTK4 popup that writes the underscan percent to airfry's config."
+license = "MIT"
+
+[[bin]]
+name = "airfry-underscan"
+path = "src/main.rs"
+
+[dependencies]
+# Native GTK4 window styled by libadwaita so it follows the desktop's dark/light
+# color scheme + accent colour (adw::Application enables the StyleManager that
+# applies the system theme to all widgets). Single-instance is handled by
+# GApplication's unique application-id (NO hyphen in its last segment — a hyphen
+# silently breaks single-instance registration → the old infinite-twins bug).
+gtk4 = "0.9"
+libadwaita = "0.7"
+serde_json = "1"

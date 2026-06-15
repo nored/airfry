@@ -379,7 +379,7 @@ impl AudioCapture {
         // we prefer pulsesrc (the task spec) and only fall back to a bare
         // pipewiresrc when pulsesrc cannot be created.
         let src = if test_tone {
-            eprintln!("[audio] using test tone (440 Hz sine, spf={AUDIO_SPF})");
+            crate::dlog!("[audio] using test tone (440 Hz sine, spf={AUDIO_SPF})");
             gst::ElementFactory::make("audiotestsrc")
                 .property_from_str("wave", "sine")
                 .property("freq", 440.0f64)
@@ -388,13 +388,13 @@ impl AudioCapture {
                 .build()
                 .context("create audiotestsrc")?
         } else if let Some(monitor) = detect_pulse_monitor() {
-            eprintln!("[audio] using pulsesrc device={monitor}");
+            crate::dlog!("[audio] using pulsesrc device={monitor}");
             gst::ElementFactory::make("pulsesrc")
                 .property("device", &monitor)
                 .build()
                 .context("create pulsesrc (install gst-plugin-pulseaudio)")?
         } else if let Ok(p) = gst::ElementFactory::make("pipewiresrc").build() {
-            eprintln!("[audio] using pipewiresrc");
+            crate::dlog!("[audio] using pipewiresrc");
             p
         } else {
             bail!("no PulseAudio monitor source found (need pulsesrc or pipewiresrc)");
@@ -520,7 +520,7 @@ impl AudioCapture {
         }
         if discarded > 0 {
             let bytes_per_second = (AUDIO_SAMPLE_RATE * 2 * 2) as f64; // 44.1k, stereo, S16LE
-            eprintln!(
+            crate::dlog!(
                 "[audio] drained {discarded} bytes (~{:.0}ms) of startup backlog before streaming",
                 discarded as f64 / bytes_per_second * 1000.0
             );
@@ -799,7 +799,7 @@ pub fn setup_audio_stream(
     } else {
         "none"
     };
-    eprintln!(
+    crate::dlog!(
         "[audio] stream setup: dataPort={data_port} controlPort={control_port} ct={ct} spf={AUDIO_SPF} ssrc=0x00000000 security={security_name}"
     );
 
@@ -823,7 +823,7 @@ pub fn setup_audio_stream(
     };
 
     if stream.chacha.is_some() {
-        eprintln!(
+        crate::dlog!(
             "[audio] chacha config: nonce={} aad={}",
             stream.chacha_nonce_mode.as_str(),
             stream.chacha_aad_mode.as_str()
@@ -856,14 +856,14 @@ pub fn stream_audio(
     };
 
     // Wait for the first video frame before starting audio (audio.go).
-    eprintln!("[audio] waiting for first video frame before starting audio...");
+    crate::dlog!("[audio] waiting for first video frame before starting audio...");
     while !first_frame.load(Ordering::Relaxed) {
         if stop.load(Ordering::Relaxed) {
             return Ok(());
         }
         std::thread::sleep(Duration::from_millis(20));
     }
-    eprintln!("[audio] first video frame sent, starting audio");
+    crate::dlog!("[audio] first video frame sent, starting audio");
 
     // Initial sync burst: 7 identical X=1 sync packets before any audio data.
     let ntp_now = ntp_boot_timestamp(boot_origin);
@@ -871,7 +871,7 @@ pub fn stream_audio(
         let a = audio.lock().unwrap();
         for _ in 0..7 {
             if let Err(e) = a.send_sync_packet(ntp_now, true) {
-                eprintln!("[audio] initial sync error: {e}");
+                crate::dlog!("[audio] initial sync error: {e}");
             }
         }
     }
@@ -885,7 +885,7 @@ pub fn stream_audio(
         ls
     };
     let mut next_rtp = latency_samples;
-    eprintln!("[audio] sent initial sync burst (7 packets), starting audio at rtp={next_rtp}");
+    crate::dlog!("[audio] sent initial sync burst (7 packets), starting audio at rtp={next_rtp}");
 
     // Periodic sync sender: every 200ms for the first 5s, then every 1s.
     {
@@ -909,7 +909,7 @@ pub fn stream_audio(
                 let nt = ntp_boot_timestamp(boot_origin);
                 let a = audio.lock().unwrap();
                 if let Err(e) = a.send_sync_packet(nt, false) {
-                    eprintln!("[audio] sync error: {e}");
+                    crate::dlog!("[audio] sync error: {e}");
                 }
             }
         });
@@ -953,9 +953,9 @@ pub fn stream_audio(
         use_audio_fec(a.is_chacha())
     };
     if use_fec {
-        eprintln!("[audio] FEC enabled: burst-8 + interleaved retransmit");
+        crate::dlog!("[audio] FEC enabled: burst-8 + interleaved retransmit");
     } else {
-        eprintln!("[audio] FEC disabled for ChaCha-encrypted sessions: each frame sent once");
+        crate::dlog!("[audio] FEC disabled for ChaCha-encrypted sessions: each frame sent once");
     }
 
     const RETRANSMIT_DEPTH: usize = 8;
@@ -1011,7 +1011,7 @@ pub fn stream_audio(
             if retransmit_idx >= RETRANSMIT_DEPTH {
                 burst_done = true;
                 retransmit_idx = 0;
-                eprintln!("[audio] initial burst of {RETRANSMIT_DEPTH} frames complete");
+                crate::dlog!("[audio] initial burst of {RETRANSMIT_DEPTH} frames complete");
             }
         } else {
             // Steady state: retransmit an old frame, then send the new one.
@@ -1039,7 +1039,7 @@ pub fn stream_audio(
         next_rtp = next_rtp.wrapping_add(spf);
 
         if frame_count <= 10 || frame_count % 100 == 0 {
-            eprintln!(
+            crate::dlog!(
                 "[audio] sent frame {frame_count}: seq={} payload={n} rtp={}",
                 frame_seq - 1,
                 next_rtp - spf

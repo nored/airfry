@@ -8,12 +8,14 @@
 mod audio;
 mod broadcast;
 mod capture;
+mod config;
 mod credentials;
 mod daemon;
 mod dbglog;
 mod daemonclient;
 mod discovery;
 mod fairplay;
+mod icon;
 mod info;
 mod latency;
 mod mirror;

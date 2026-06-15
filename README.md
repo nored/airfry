@@ -2,9 +2,10 @@
 
 A native **Linux AirPlay screen-mirroring sender** for Apple TV — mirror your
 desktop to an Apple TV with nothing installed on the TV. Written in Rust, with a
-**system-tray widget** (no main window) and an **underscan slider right in the
-tray menu**, plus an in-house port of the FairPlay handshake (Apple's
-proprietary blob is never shipped in this repo — see below).
+**native system-tray widget** (StatusNotifierItem — no main window, no Qt) whose
+icon is white when idle and **turns blue while mirroring**, plus **underscan you
+adjust by scrolling the tray icon**, and an in-house port of the FairPlay
+handshake (Apple's proprietary blob is never shipped in this repo — see below).
 
 ## Install (Arch Linux, one line)
 
@@ -21,12 +22,20 @@ remove with `pacman -R airfry`).
 Launch **AirFry** from your app menu, or run `airfry`. It lives in the system
 tray:
 
-- **Click the tray icon** → it scans and lists AirPlay receivers.
-- **Click a receiver** → it pairs and starts mirroring this screen to it.
-- **Underscan slider** (right in the tray menu): if the picture spills past the
-  edges of your TV, drag it until it fits. The value persists and applies to the
-  next mirror session.
+- **Open the tray menu** → it scans (only on open, never in the background) and
+  lists AirPlay receivers. The last-seen list is cached, so the menu is
+  populated instantly on launch; **Rescan** forces a fresh scan.
+- **Click a receiver** → it pairs and starts mirroring this screen to it. The
+  icon turns **blue** while mirroring. While streaming the menu shows **Stop**,
+  **Mute/Unmute** and **Change display** instead of the device list.
+- **Underscan** (in the tray, no window): **scroll the tray icon** up/down to
+  shrink/grow the picture if it spills past the edges of your TV, or pick a step
+  from the **Underscan** submenu. A text-art bar shows the current value. It
+  persists and applies to the next mirror session.
 - **Quit** stops mirroring and exits.
+
+When nothing is streaming, AirFry does no background work — discovery only runs
+while the menu is open and capture/encode only runs while mirroring.
 
 On Wayland (GNOME/KDE) the first mirror triggers the system **ScreenCast
 portal** to pick a display. Hardware H.264 encoding uses VA-API
@@ -50,7 +59,9 @@ A Rust workspace:
   doubletake's Go `fpemu`, validated byte-for-byte against golden vectors.
 - **`rust/airfry`** — the sender: mDNS discovery, HomeKit/transient pairing,
   PlayFair stream-key derivation (golden-tested), RTSP transport, the
-  H.264/RTP mirror stream, GStreamer capture/encode, and the Qt tray.
+  H.264/RTP mirror stream, GStreamer capture/encode, and the native
+  StatusNotifierItem tray (via the vendored `third_party/ksni`, patched to
+  surface the menu-open event so it scans only on open).
 
 ### About the FairPlay blob — not shipped here
 
