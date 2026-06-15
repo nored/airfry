@@ -125,6 +125,14 @@ fn pair_headers() -> &'static [(&'static str, &'static str)] {
     &[("X-Apple-HKP", "3")]
 }
 
+/// Ask the receiver to display its pairing PIN on screen (doubletake
+/// StartPINDisplay / main.go promptForPIN). POST /pair-pin-start, empty body.
+/// Must be called before prompting the user for the code.
+pub fn pair_pin_start(transport: &mut Transport) -> Result<()> {
+    transport.request("POST", "/pair-pin-start", "", &[], pair_headers())?;
+    Ok(())
+}
+
 /// Run pair-setup. An empty `pin` performs the transient flow; otherwise PIN.
 /// Generates a fresh ed25519 identity and returns the resulting `PairKeys`
 /// (without the X25519 shared secret, which pair-verify fills in).

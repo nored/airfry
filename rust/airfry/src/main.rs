@@ -88,8 +88,27 @@ fn cmd_pair(args: &[String]) -> i32 {
         let mark = if ok { "OK " } else { "FAIL" };
         println!("[{mark}] {phase}: {detail}");
     };
+    // If the receiver requires a code, it shows a PIN on screen and we read it
+    // from stdin (doubletake main.go promptForPIN).
+    let mut ask_pin = || {
+        use std::io::Write;
+        eprint!("Enter the PIN shown on the Apple TV: ");
+        let _ = std::io::stderr().flush();
+        let mut line = String::new();
+        match std::io::stdin().read_line(&mut line) {
+            Ok(_) => {
+                let p = line.trim().to_string();
+                if p.is_empty() {
+                    None
+                } else {
+                    Some(p)
+                }
+            }
+            Err(_) => None,
+        }
+    };
 
-    match rtsp::Session::connect_host_with(&host, port, pin, &mut report) {
+    match rtsp::Session::connect_host_with(&host, port, pin, &mut ask_pin, &mut report) {
         Ok(session) => {
             println!("\nSession established.");
             println!(
@@ -175,8 +194,22 @@ fn cmd_mirror(args: &[String]) -> i32 {
         let mark = if ok { "OK " } else { "FAIL" };
         eprintln!("[{mark}] {phase}: {detail}");
     };
+    let mut ask_pin = || {
+        use std::io::Write;
+        eprint!("Enter the PIN shown on the Apple TV: ");
+        let _ = std::io::stderr().flush();
+        let mut line = String::new();
+        match std::io::stdin().read_line(&mut line) {
+            Ok(_) => {
+                let p = line.trim().to_string();
+                if p.is_empty() { None } else { Some(p) }
+            }
+            Err(_) => None,
+        }
+    };
 
-    let session = match rtsp::Session::connect_host_with(&host, port, &pin, &mut report) {
+    let session = match rtsp::Session::connect_host_with(&host, port, &pin, &mut ask_pin, &mut report)
+    {
         Ok(s) => s,
         Err(e) => {
             eprintln!("pairing failed: {e:#}");

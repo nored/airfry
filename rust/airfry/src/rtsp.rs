@@ -451,6 +451,7 @@ impl Session {
             "",
             &mds_pk,
             &device_key,
+            &mut || None,
             &mut |_, _, _| {},
         )
     }
@@ -458,18 +459,21 @@ impl Session {
     /// Like `connect`, but takes an explicit host/port and optional PIN.
     /// An empty `pin` selects the transient (PIN-less) flow.
     pub fn connect_host(host: &str, port: u16, pin: &str) -> Result<Session> {
-        Self::connect_host_with(host, port, pin, &mut |_phase, _ok, _detail| {})
+        Self::connect_host_with(host, port, pin, &mut || None, &mut |_phase, _ok, _detail| {})
     }
 
     /// Full handshake with a progress callback: `progress(phase, ok, detail)`.
+    /// `pin_provider` is called to obtain the displayed pairing code when the
+    /// receiver rejects PIN-less pairing (return `None` to abort).
     pub fn connect_host_with(
         host: &str,
         port: u16,
         pin: &str,
+        pin_provider: &mut dyn FnMut() -> Option<String>,
         progress: &mut dyn FnMut(&str, bool, &str),
     ) -> Result<Session> {
         // Key the credential store by host when no stable device id is known.
-        Self::connect_host_full(host, port, pin, &[], host, progress)
+        Self::connect_host_full(host, port, pin, &[], host, pin_provider, progress)
     }
 
     /// Full handshake, with an optional caller-supplied receiver ed25519 PK
@@ -481,6 +485,7 @@ impl Session {
         pin: &str,
         mdns_pk: &[u8],
         device_id: &str,
+        pin_provider: &mut dyn FnMut() -> Option<String>,
         progress: &mut dyn FnMut(&str, bool, &str),
     ) -> Result<Session> {
         // Open the persistent credential store (non-fatal on any IO error) and
@@ -535,86 +540,57 @@ impl Session {
             info.pk = mdns_pk.to_vec();
         }
 
-        // ---- Pairing fallback order (pairing.go performTransientSetupAndVerify):
-        // For the transient (PIN-less) flow, try the raw binary pair-setup first
-        // (UxPlay / legacy AirPlay); on success run the raw pair-verify and keep
-        // the connection PLAINTEXT. If raw pair-setup fails, fall back to the
-        // TLV8 / HomeKit transient pair-setup + HAP pair-verify (Apple TV).
-        // A non-empty PIN always uses the TLV8 PIN flow + HAP pair-verify.
-        let mut pair_keys = PairKeys::default();
-        let mut raw_path = false;
+        // ---- Pairing decision tree (doubletake cmd/doubletake/main.go:126-228).
+        // An explicit PIN does a full PIN pairing directly. With no PIN we try
+        // the transient (raw->TLV8) flow; if the receiver rejects it (e.g. it
+        // requires a code), we ask it to DISPLAY its PIN, prompt the caller for
+        // the code, RECONNECT on a fresh socket, and do a PIN pairing — exactly
+        // doubletake's promptForPIN + reconnect fallback.
+        let pair_keys: PairKeys;
 
-        if pin.is_empty() {
-            let mut raw_keys = PairKeys::default();
-            match pairing::raw_pair_setup(&mut transport, &mut raw_keys) {
-                Ok(server_pub) => {
-                    progress("pair-setup", true, "raw (legacy) pair-setup OK");
-                    // The key returned by raw pair-setup is the receiver's
-                    // ed25519 pk used by raw pair-verify (matches Go: c.info.PK
-                    // = serverPub after a successful rawPairSetup).
-                    info.pk = server_pub;
-                    match pairing::raw_pair_verify(&mut transport, &mut raw_keys, &info.pk) {
-                        Ok(()) => {
-                            progress("pair-verify", true, "raw pair-verify (plaintext)");
-                            pair_keys = raw_keys;
-                            raw_path = true;
-                        }
-                        Err(e) => {
-                            progress("pair-verify", false, &e.to_string());
-                            return Err(e.context("raw pair-verify"));
-                        }
-                    }
-                }
+        if !pin.is_empty() {
+            // Explicit PIN: full PIN pairing, then persist the identity.
+            let keys = do_pairing(&mut transport, &mut info, pin, &pairing_id, reuse_seed, progress)?;
+            let _ = cred_store
+                .save(device_id, &pairing_id, &keys.ed25519_public, &keys.ed25519_seed)
+                .map(|_| progress("credentials", true, "saved pairing identity"));
+            pair_keys = keys;
+        } else {
+            match do_pairing(&mut transport, &mut info, "", &pairing_id, reuse_seed, progress) {
+                Ok(keys) => pair_keys = keys,
                 Err(e) => {
-                    // Fall back to TLV8 transient pair-setup + HAP pair-verify.
                     progress(
                         "pair-setup",
                         false,
-                        &format!("raw failed ({e}); trying TLV8"),
+                        &format!("transient failed ({e}); receiver requires a pairing code"),
                     );
-                }
-            }
-        }
-
-        if !raw_path {
-            // TLV8 transient (or PIN) pair-setup, reusing the saved ed25519
-            // identity when one is available.
-            pair_keys =
-                match pairing::pair_setup_with_identity(&mut transport, &pairing_id, pin, reuse_seed)
-                {
-                    Ok(k) => {
-                        progress("pair-setup", true, "SRP exchange complete");
-                        k
+                    // Ask the receiver to show its PIN (best effort on this conn).
+                    let _ = pairing::pair_pin_start(&mut transport);
+                    // Prompt the caller (stdin / tray dialog) for the displayed code.
+                    let code = match pin_provider() {
+                        Some(p) if !p.trim().is_empty() => p.trim().to_string(),
+                        _ => {
+                            return Err(e
+                                .context("receiver requires a pairing code, but none was provided"))
+                        }
+                    };
+                    progress("pin", true, "got pairing code; reconnecting");
+                    // Reconnect on a FRESH socket — the failed attempt dirtied it.
+                    drop(transport);
+                    let mut t2 = Transport::connect(host, port)
+                        .context("reconnect for PIN pairing")?;
+                    let mut info2 = info::get_info(&mut t2).unwrap_or_default();
+                    if info2.pk.is_empty() && !mdns_pk.is_empty() {
+                        info2.pk = mdns_pk.to_vec();
                     }
-                    Err(e) => {
-                        progress("pair-setup", false, &e.to_string());
-                        return Err(e.context("pair-setup"));
-                    }
-                };
-
-            // A non-empty PIN is a FULL pairing: persist the long-term identity so
-            // future connections to this device can reuse it (transient PIN-less
-            // pairing is ephemeral and is NOT saved, matching doubletake's store
-            // which is only fed by the full pairing path).
-            if !pin.is_empty() {
-                match cred_store.save(
-                    device_id,
-                    &pairing_id,
-                    &pair_keys.ed25519_public,
-                    &pair_keys.ed25519_seed,
-                ) {
-                    Ok(()) => progress("credentials", true, "saved pairing identity"),
-                    // Persisting is best-effort; an IO error must not fail pairing.
-                    Err(e) => progress("credentials", false, &e.to_string()),
-                }
-            }
-
-            // HAP pair-verify (X25519); enables HAP encryption on the transport.
-            match pairing::pair_verify(&mut transport, &pairing_id, &mut pair_keys) {
-                Ok(()) => progress("pair-verify", true, "control channel encrypted"),
-                Err(e) => {
-                    progress("pair-verify", false, &e.to_string());
-                    return Err(e.context("pair-verify"));
+                    let keys =
+                        do_pairing(&mut t2, &mut info2, &code, &pairing_id, reuse_seed, progress)?;
+                    let _ = cred_store
+                        .save(device_id, &pairing_id, &keys.ed25519_public, &keys.ed25519_seed)
+                        .map(|_| progress("credentials", true, "saved pairing identity"));
+                    transport = t2;
+                    info = info2;
+                    pair_keys = keys;
                 }
             }
         }
@@ -643,6 +619,49 @@ impl Session {
             info,
         })
     }
+}
+
+/// Run one pairing attempt on `transport` and return the resulting `PairKeys`
+/// (ready for fp-setup). An empty `pin` does the transient flow (raw legacy
+/// pair-setup first, then TLV8 transient + HAP pair-verify); a non-empty `pin`
+/// does a HomeKit PIN pair-setup + HAP pair-verify. Mirrors the per-attempt
+/// logic of doubletake's AirPlayClient.Pair.
+fn do_pairing(
+    transport: &mut Transport,
+    info: &mut ReceiverInfo,
+    pin: &str,
+    pairing_id: &str,
+    reuse_seed: Option<[u8; 32]>,
+    progress: &mut dyn FnMut(&str, bool, &str),
+) -> Result<PairKeys> {
+    if pin.is_empty() {
+        // Raw (UxPlay/legacy) pair-setup first; on success the connection stays
+        // plaintext and we use raw pair-verify.
+        let mut raw_keys = PairKeys::default();
+        match pairing::raw_pair_setup(transport, &mut raw_keys) {
+            Ok(server_pub) => {
+                progress("pair-setup", true, "raw (legacy) pair-setup OK");
+                info.pk = server_pub;
+                pairing::raw_pair_verify(transport, &mut raw_keys, &info.pk)
+                    .context("raw pair-verify")?;
+                progress("pair-verify", true, "raw pair-verify (plaintext)");
+                return Ok(raw_keys);
+            }
+            Err(e) => {
+                progress("pair-setup", false, &format!("raw failed ({e}); trying TLV8"));
+            }
+        }
+    }
+
+    // TLV8 transient (empty pin) or HomeKit PIN pair-setup, reusing a saved
+    // ed25519 identity when supplied.
+    let mut keys = pairing::pair_setup_with_identity(transport, pairing_id, pin, reuse_seed)
+        .context("pair-setup")?;
+    progress("pair-setup", true, "SRP exchange complete");
+    // HAP pair-verify (X25519) — enables HAP encryption on the transport.
+    pairing::pair_verify(transport, pairing_id, &mut keys).context("pair-verify")?;
+    progress("pair-verify", true, "control channel encrypted");
+    Ok(keys)
 }
 
 /// Decode a lowercase/uppercase hex string into bytes; returns empty on any

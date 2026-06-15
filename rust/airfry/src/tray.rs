@@ -234,7 +234,11 @@ fn start_mirror(addr: &str) {
         opts.fit_pct = pct;
 
         let mut report = |_phase: &str, _ok: bool, _detail: &str| {};
-        let session = match rtsp::Session::connect_host_with(&host, port, "", &mut report) {
+        // TODO: prompt for the PIN via a Qt dialog when the receiver requires a
+        // code. For now the tray attempts PIN-less pairing only.
+        let mut ask_pin = || None;
+        let session =
+            match rtsp::Session::connect_host_with(&host, port, "", &mut ask_pin, &mut report) {
             Ok(s) => s,
             Err(e) => {
                 set_status(&format!("Connect failed: {e}"));
