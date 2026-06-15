@@ -44,7 +44,7 @@ use hkdf::Hkdf;
 use sha2::{Digest, Sha512};
 
 use crate::capture::{CaptureConfig, CaptureSource};
-use crate::rtsp::Session;
+use crate::rtsp::{Session, Transport};
 
 type Aes128Ctr = ctr::Ctr128BE<aes::Aes128>;
 
@@ -754,7 +754,7 @@ pub fn run_mirror(session: Session, opts: MirrorOpts) -> Result<()> {
 /// Like `run_mirror`, but driven by a caller-owned stop flag so an external
 /// controller (e.g. the tray) can stop or switch the mirror at any time.
 pub fn run_mirror_with_stop(
-    mut session: Session,
+    session: Session,
     opts: MirrorOpts,
     stop: Arc<AtomicBool>,
 ) -> Result<()> {
@@ -775,6 +775,20 @@ pub fn run_mirror_with_stop(
     // ---- Encryption key material (mirror.go: encKey/encIV = streamKey/iv) ----
     let enc_key = session.stream_key;
     let enc_iv = session.iv;
+
+    // Receiver presentation (display) size from GET /info; the codec header
+    // carries this so the receiver can center/pillarbox content (mirror.go feeds
+    // DisplaySize() when nonzero, else sendCodecFrame falls back to content size).
+    let (display_w, display_h) = session.info.display_size();
+    if display_w > 0 && display_h > 0 {
+        eprintln!("[mirror] receiver display size: {display_w}x{display_h}");
+    }
+
+    // Keep the pieces we need from the session before moving the control
+    // transport behind an Arc<Mutex> so the keepalive threads can share it.
+    let ekey = session.ekey.clone();
+    let pair_shared_secret = session.pair_keys.shared_secret.clone();
+    let control = Arc::new(Mutex::new(session.transport));
 
     // ---- NTP timing responder: bind a UDP socket and answer probes ----
     let timing_sock = std::net::UdpSocket::bind("0.0.0.0:0").context("bind timing UDP")?;
@@ -822,7 +836,7 @@ pub fn run_mirror_with_stop(
     audio_setup.insert("name".into(), Value::String("MacBook Pro".into()));
     // FairPlay ekey/eiv (legacy AES path on the receiver). et=32.
     audio_setup.insert("et".into(), Value::Integer(32i64.into()));
-    audio_setup.insert("ekey".into(), Value::Data(session.ekey.clone()));
+    audio_setup.insert("ekey".into(), Value::Data(ekey.clone()));
     audio_setup.insert("eiv".into(), Value::Data(enc_iv.to_vec()));
     audio_setup.insert(
         "streams".into(),
@@ -830,8 +844,9 @@ pub fn run_mirror_with_stop(
     );
 
     let audio_body = marshal_plist(&Value::Dictionary(audio_setup))?;
-    let audio_resp = session
-        .transport
+    let audio_resp = control
+        .lock()
+        .unwrap()
         .request(
             "SETUP",
             &audio_uri,
@@ -881,7 +896,7 @@ pub fn run_mirror_with_stop(
     video_setup.insert("name".into(), Value::String("MacBook Pro".into()));
     if !opts.no_encrypt {
         // UxPlay reads ekey/eiv from the root level.
-        video_setup.insert("ekey".into(), Value::Data(session.ekey.clone()));
+        video_setup.insert("ekey".into(), Value::Data(ekey.clone()));
         video_setup.insert("eiv".into(), Value::Data(enc_iv.to_vec()));
     }
     video_setup.insert(
@@ -890,8 +905,9 @@ pub fn run_mirror_with_stop(
     );
 
     let video_body = marshal_plist(&Value::Dictionary(video_setup))?;
-    let video_resp = session
-        .transport
+    let video_resp = control
+        .lock()
+        .unwrap()
         .request(
             "SETUP",
             &video_uri,
@@ -926,8 +942,9 @@ pub fn run_mirror_with_stop(
     eprintln!("[mirror] data channel connected: {data_addr}");
 
     // ---- RECORD ----
-    session
-        .transport
+    control
+        .lock()
+        .unwrap()
         .request(
             "RECORD",
             &audio_uri,
@@ -943,14 +960,14 @@ pub fn run_mirror_with_stop(
 
     // ---- SET_PARAMETER volume (max), sent twice like real senders ----
     let volume_body = b"volume: 0.000000\r\n";
-    let _ = session.transport.request(
+    let _ = control.lock().unwrap().request(
         "SET_PARAMETER",
         &audio_uri,
         "text/parameters",
         volume_body,
         &[],
     );
-    let _ = session.transport.request(
+    let _ = control.lock().unwrap().request(
         "SET_PARAMETER",
         &audio_uri,
         "text/parameters",
@@ -965,9 +982,9 @@ pub fn run_mirror_with_stop(
     let cipher = if opts.no_encrypt {
         eprintln!("[mirror] video frame encryption DISABLED");
         VideoCipher::None
-    } else if !session.pair_keys.shared_secret.is_empty() {
+    } else if !pair_shared_secret.is_empty() {
         let chacha_key =
-            derive_chacha_key(&session.pair_keys.shared_secret, video_stream_connection_id)?;
+            derive_chacha_key(&pair_shared_secret, video_stream_connection_id)?;
         let aead = ChaCha20Poly1305::new_from_slice(&chacha_key)
             .map_err(|_| anyhow!("chacha key length"))?;
         eprintln!("[mirror] cipher: ChaCha20-Poly1305 (HKDF-SHA512)");
@@ -978,15 +995,16 @@ pub fn run_mirror_with_stop(
         VideoCipher::AesCtr(MirrorCipher::new(&k, &iv))
     };
 
-    // Receiver display/presentation size: not probed here (the unauthenticated
-    // /info path is not wired in), so the codec header falls back to the encoded
-    // content size (mirror.go behaviour when DisplaySize() is 0).
+    // Receiver display/presentation size from GET /info: fed into the codec
+    // header (offsets 56/60). When the receiver advertised no usable size these
+    // stay 0 and sendCodecFrame falls back to the encoded content size
+    // (mirror.go behaviour when DisplaySize() is 0).
     let data = Arc::new(Mutex::new(DataChannel {
         conn,
         cipher,
         frame_seq: 0,
-        display_w: 0,
-        display_h: 0,
+        display_w: display_w as i32,
+        display_h: display_h as i32,
         video_w: 0,
         video_h: 0,
     }));
@@ -1020,6 +1038,18 @@ pub fn run_mirror_with_stop(
         });
     }
 
+    // RTSP keepalive loops on the control channel (mirror.go heartbeatLoop +
+    // feedbackLoop). Both run on background threads sharing the control
+    // transport behind the Arc<Mutex>, and stop when `stop` is set.
+    spawn_heartbeat_loop(
+        control.clone(),
+        audio_uri.clone(),
+        session_uuid.clone(),
+        first_frame.clone(),
+        stop.clone(),
+    );
+    spawn_feedback_loop(control.clone(), first_frame.clone(), stop.clone());
+
     // Ctrl-C handler: flip the stop flag so the capture loop exits cleanly.
     {
         let stop = stop.clone();
@@ -1042,11 +1072,117 @@ pub fn run_mirror_with_stop(
     capture.stop();
 
     // ---- TEARDOWN ----
-    let _ = session
-        .transport
+    let _ = control
+        .lock()
+        .unwrap()
         .request("TEARDOWN", &audio_uri, "", &[], &[]);
 
     result
+}
+
+// ---------------------------------------------------------------------------
+// RTSP control-channel keepalive loops (mirror.go heartbeatLoop + feedbackLoop)
+// ---------------------------------------------------------------------------
+
+/// heartbeatLoop — periodic GET_PARAMETER on the control URI every 15s, with
+/// the `Session` header. Some receivers (Apple TV) return 400 for
+/// GET_PARAMETER; after 3 consecutive failures we silently stop (the /feedback
+/// POST and data-channel heartbeat provide redundant keepalive). Waits for the
+/// first video frame before starting, and stops when `stop` is set.
+fn spawn_heartbeat_loop(
+    control: Arc<Mutex<Transport>>,
+    uri: String,
+    session_id: String,
+    first_frame: Arc<AtomicBool>,
+    stop: Arc<AtomicBool>,
+) {
+    std::thread::spawn(move || {
+        // Gate on the first video frame (mirror.go starts the loops then, and
+        // the loop body waits implicitly; here we wait explicitly).
+        while !first_frame.load(Ordering::Relaxed) {
+            if stop.load(Ordering::Relaxed) {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+
+        let mut consecutive_failures = 0u32;
+        loop {
+            // 15s tick, checking the stop flag every 100ms.
+            let mut waited = Duration::ZERO;
+            while waited < Duration::from_secs(15) {
+                if stop.load(Ordering::Relaxed) {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(100));
+                waited += Duration::from_millis(100);
+            }
+            if stop.load(Ordering::Relaxed) {
+                return;
+            }
+
+            let res = {
+                let mut t = control.lock().unwrap();
+                t.request(
+                    "GET_PARAMETER",
+                    &uri,
+                    "",
+                    &[],
+                    &[("Session", session_id.as_str())],
+                )
+            };
+            match res {
+                Ok(_) => consecutive_failures = 0,
+                Err(_) => {
+                    consecutive_failures += 1;
+                    if consecutive_failures >= 3 {
+                        // Silently disable GET_PARAMETER keepalive.
+                        return;
+                    }
+                }
+            }
+        }
+    });
+}
+
+/// feedbackLoop — POST /feedback every 2s, with an immediate first feedback to
+/// beat UxPlay's ~3s timeout. Waits for the first video frame, then stops when
+/// `stop` is set. Faithful port of mirror.go's feedbackLoop.
+fn spawn_feedback_loop(
+    control: Arc<Mutex<Transport>>,
+    first_frame: Arc<AtomicBool>,
+    stop: Arc<AtomicBool>,
+) {
+    std::thread::spawn(move || {
+        while !first_frame.load(Ordering::Relaxed) {
+            if stop.load(Ordering::Relaxed) {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+
+        // Immediate first feedback (mirror.go sends one before the ticker).
+        {
+            let mut t = control.lock().unwrap();
+            let _ = t.request("POST", "/feedback", "", &[], &[]);
+        }
+
+        loop {
+            let mut waited = Duration::ZERO;
+            while waited < Duration::from_secs(2) {
+                if stop.load(Ordering::Relaxed) {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(100));
+                waited += Duration::from_millis(100);
+            }
+            if stop.load(Ordering::Relaxed) {
+                return;
+            }
+            let mut t = control.lock().unwrap();
+            let _ = t.request("POST", "/feedback", "", &[], &[]);
+        }
+    });
 }
 
 /// stream_frames — the NAL-parsing send loop, a faithful port of

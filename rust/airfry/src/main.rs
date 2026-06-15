@@ -8,6 +8,7 @@
 mod capture;
 mod discovery;
 mod fairplay;
+mod info;
 mod mirror;
 mod pairing;
 mod playfair;

@@ -19,6 +19,7 @@ use chacha20poly1305::ChaCha20Poly1305;
 
 use crate::discovery::AirPlayDevice;
 use crate::fairplay::{self, FairPlayKeys};
+use crate::info::{self, ReceiverInfo};
 use crate::pairing::{self, PairKeys};
 
 const USER_AGENT: &str = "AirPlay/935.7.1";
@@ -139,6 +140,49 @@ impl Transport {
             .context("write request to socket")?;
 
         self.read_response()
+    }
+
+    /// Send a bare RTSP/1.0 request without HAP encryption and without
+    /// `X-Apple-Session-ID`, used by the raw (UxPlay/legacy) pair-verify
+    /// protocol. Faithful port of Go `rawRequest`: the header order is
+    /// Content-Type, User-Agent, X-Apple-ProtocolVersion, extras,
+    /// Content-Length, CSeq — and the body/response are always plaintext even
+    /// when HAP encryption has been enabled.
+    pub fn raw_request(
+        &mut self,
+        method: &str,
+        path: &str,
+        content_type: &str,
+        body: &[u8],
+        extra_headers: &[(&str, &str)],
+    ) -> Result<Response> {
+        self.cseq += 1;
+        let seq = self.cseq;
+
+        let mut buf = Vec::new();
+        write!(buf, "{method} {path} RTSP/1.0\r\n")?;
+        write!(buf, "Content-Type: {content_type}\r\n")?;
+        write!(buf, "User-Agent: {USER_AGENT}\r\n")?;
+        write!(buf, "X-Apple-ProtocolVersion: 1\r\n")?;
+        for (k, v) in extra_headers {
+            write!(buf, "{k}: {v}\r\n")?;
+        }
+        write!(buf, "Content-Length: {}\r\n", body.len())?;
+        write!(buf, "CSeq: {seq}\r\n")?;
+        buf.extend_from_slice(b"\r\n");
+        buf.extend_from_slice(body);
+
+        self.conn
+            .write_all(&buf)
+            .context("write raw request to socket")?;
+
+        // Raw path is always plaintext, regardless of `self.encrypted`.
+        self.conn
+            .set_read_timeout(Some(Duration::from_secs(30)))
+            .ok();
+        let r = self.read_plaintext_response();
+        self.conn.set_read_timeout(None).ok();
+        r
     }
 
     fn read_response(&mut self) -> Result<Response> {
@@ -354,6 +398,10 @@ pub struct Session {
     pub pairing_id: String,
     /// Per-connection session identifier (UUID).
     pub session_id: String,
+
+    /// Parsed GET /info response (receiver display size, ed25519 pk, features).
+    /// Empty/default when /info could not be fetched.
+    pub info: ReceiverInfo,
 }
 
 impl Session {
@@ -361,7 +409,11 @@ impl Session {
     /// pair-setup (transient) -> pair-verify -> fp-setup. Each phase's outcome
     /// is reported through `progress`.
     pub fn connect(device: &AirPlayDevice) -> Result<Session> {
-        Self::connect_host(&device.ip, device.port, "")
+        // Seed the server ed25519 PK from the mDNS `pk` TXT record when present,
+        // so the raw pair-verify can verify the server signature even before
+        // /info is parsed. Decoded from hex; ignored if malformed.
+        let mds_pk = decode_hex(&device.pk);
+        Self::connect_host_full(&device.ip, device.port, "", &mds_pk, &mut |_, _, _| {})
     }
 
     /// Like `connect`, but takes an explicit host/port and optional PIN.
@@ -375,6 +427,19 @@ impl Session {
         host: &str,
         port: u16,
         pin: &str,
+        progress: &mut dyn FnMut(&str, bool, &str),
+    ) -> Result<Session> {
+        Self::connect_host_full(host, port, pin, &[], progress)
+    }
+
+    /// Full handshake, with an optional caller-supplied receiver ed25519 PK
+    /// (e.g. from the mDNS `pk` record) used as a fallback for the raw
+    /// pair-verify signature check.
+    fn connect_host_full(
+        host: &str,
+        port: u16,
+        pin: &str,
+        mdns_pk: &[u8],
         progress: &mut dyn FnMut(&str, bool, &str),
     ) -> Result<Session> {
         let pairing_id = pairing::generate_uuid();
@@ -391,24 +456,89 @@ impl Session {
             }
         };
 
-        // pair-setup (transient SRP, or PIN-based when a PIN is given).
-        let mut pair_keys = match pairing::pair_setup(&mut transport, &pairing_id, pin) {
-            Ok(k) => {
-                progress("pair-setup", true, "SRP exchange complete");
-                k
+        // GET /info first: surfaces the receiver display size (codec header)
+        // and the ed25519 pk that raw pair-verify needs. Best-effort: a failure
+        // here is non-fatal (some receivers gate /info behind pairing).
+        let mut info = match info::get_info(&mut transport) {
+            Ok(i) => {
+                progress(
+                    "info",
+                    true,
+                    &format!("display {:?}, pk {} bytes", i.display_size(), i.pk.len()),
+                );
+                i
             }
             Err(e) => {
-                progress("pair-setup", false, &e.to_string());
-                return Err(e.context("pair-setup"));
+                progress("info", false, &e.to_string());
+                ReceiverInfo::default()
             }
         };
+        // Fall back to the mDNS pk when /info did not advertise one.
+        if info.pk.is_empty() && !mdns_pk.is_empty() {
+            info.pk = mdns_pk.to_vec();
+        }
 
-        // pair-verify (X25519); enables HAP encryption on the transport.
-        match pairing::pair_verify(&mut transport, &pairing_id, &mut pair_keys) {
-            Ok(()) => progress("pair-verify", true, "control channel encrypted"),
-            Err(e) => {
-                progress("pair-verify", false, &e.to_string());
-                return Err(e.context("pair-verify"));
+        // ---- Pairing fallback order (pairing.go performTransientSetupAndVerify):
+        // For the transient (PIN-less) flow, try the raw binary pair-setup first
+        // (UxPlay / legacy AirPlay); on success run the raw pair-verify and keep
+        // the connection PLAINTEXT. If raw pair-setup fails, fall back to the
+        // TLV8 / HomeKit transient pair-setup + HAP pair-verify (Apple TV).
+        // A non-empty PIN always uses the TLV8 PIN flow + HAP pair-verify.
+        let mut pair_keys = PairKeys::default();
+        let mut raw_path = false;
+
+        if pin.is_empty() {
+            let mut raw_keys = PairKeys::default();
+            match pairing::raw_pair_setup(&mut transport, &mut raw_keys) {
+                Ok(server_pub) => {
+                    progress("pair-setup", true, "raw (legacy) pair-setup OK");
+                    // The key returned by raw pair-setup is the receiver's
+                    // ed25519 pk used by raw pair-verify (matches Go: c.info.PK
+                    // = serverPub after a successful rawPairSetup).
+                    info.pk = server_pub;
+                    match pairing::raw_pair_verify(&mut transport, &mut raw_keys, &info.pk) {
+                        Ok(()) => {
+                            progress("pair-verify", true, "raw pair-verify (plaintext)");
+                            pair_keys = raw_keys;
+                            raw_path = true;
+                        }
+                        Err(e) => {
+                            progress("pair-verify", false, &e.to_string());
+                            return Err(e.context("raw pair-verify"));
+                        }
+                    }
+                }
+                Err(e) => {
+                    // Fall back to TLV8 transient pair-setup + HAP pair-verify.
+                    progress(
+                        "pair-setup",
+                        false,
+                        &format!("raw failed ({e}); trying TLV8"),
+                    );
+                }
+            }
+        }
+
+        if !raw_path {
+            // TLV8 transient (or PIN) pair-setup.
+            pair_keys = match pairing::pair_setup(&mut transport, &pairing_id, pin) {
+                Ok(k) => {
+                    progress("pair-setup", true, "SRP exchange complete");
+                    k
+                }
+                Err(e) => {
+                    progress("pair-setup", false, &e.to_string());
+                    return Err(e.context("pair-setup"));
+                }
+            };
+
+            // HAP pair-verify (X25519); enables HAP encryption on the transport.
+            match pairing::pair_verify(&mut transport, &pairing_id, &mut pair_keys) {
+                Ok(()) => progress("pair-verify", true, "control channel encrypted"),
+                Err(e) => {
+                    progress("pair-verify", false, &e.to_string());
+                    return Err(e.context("pair-verify"));
+                }
             }
         }
 
@@ -433,6 +563,29 @@ impl Session {
             ekey: fp.ekey,
             pairing_id,
             session_id,
+            info,
         })
     }
+}
+
+/// Decode a lowercase/uppercase hex string into bytes; returns empty on any
+/// malformed input (used for the optional mDNS `pk` record).
+fn decode_hex(s: &str) -> Vec<u8> {
+    let s = s.trim();
+    if s.is_empty() || s.len() % 2 != 0 {
+        return Vec::new();
+    }
+    let mut out = Vec::with_capacity(s.len() / 2);
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        let hi = (bytes[i] as char).to_digit(16);
+        let lo = (bytes[i + 1] as char).to_digit(16);
+        match (hi, lo) {
+            (Some(h), Some(l)) => out.push((h * 16 + l) as u8),
+            _ => return Vec::new(),
+        }
+        i += 2;
+    }
+    out
 }
