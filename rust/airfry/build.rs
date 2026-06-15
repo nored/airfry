@@ -68,11 +68,21 @@ fn main() {
         .include(format!("{qt_headers}/QtGui"))
         .include(format!("{qt_headers}/QtWidgets"))
         // Qt headers require these.
-        .flag_if_supported("-Wno-deprecated-declarations");
+        .flag_if_supported("-Wno-deprecated-declarations")
+        // makepkg enables `lto` by default, putting -flto in CXXFLAGS — that
+        // turns tray.o into GCC LTO bitcode whose symbols rust-lld can't see
+        // (undefined airfry_tray_run at link). Force a normal ELF object.
+        .flag_if_supported("-fno-lto");
 
+    // Suppress cc's own link directives so we can force +whole-archive below:
+    // a clean/hardened linker (e.g. makepkg's, with --gc-sections) otherwise
+    // drops the tray objects and `airfry_tray_run` comes out undefined.
+    build.cargo_metadata(false);
     build.compile("airfry_tray");
 
-    // ---- Link Qt6. ----
+    // ---- Link our C++ tray (whole-archive) + Qt6. ----
+    println!("cargo:rustc-link-search=native={}", out_dir.display());
+    println!("cargo:rustc-link-lib=static:+whole-archive=airfry_tray");
     println!("cargo:rustc-link-search=native={qt_libs}");
     println!("cargo:rustc-link-lib=Qt6Widgets");
     println!("cargo:rustc-link-lib=Qt6Gui");

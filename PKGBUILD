@@ -26,6 +26,9 @@ optdepends=(
   'x264: software H.264 fallback encoder (gst-plugins-ugly)'
 )
 makedepends=('rust' 'git' 'qt6-base' 'gstreamer' 'gst-plugins-base')
+# makepkg's default `lto` makes cc compile the Qt tray C++ to LTO bitcode that
+# rust-lld can't resolve (undefined airfry_tray_run). Disable LTO for this build.
+options=('!lto')
 
 build() {
   cd "$startdir/rust"
