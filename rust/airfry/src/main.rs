@@ -5,8 +5,10 @@
 //! (discovery, pairing, RTSP, mirror stream) is ported from doubletake
 //! (research-only submodule; see third_party/doubletake) — credit: omarroth.
 
+mod capture;
 mod discovery;
 mod fairplay;
+mod mirror;
 mod pairing;
 mod playfair;
 mod rtsp;
@@ -21,6 +23,7 @@ fn main() {
     let code = match cmd {
         "discover" | "scan" => cmd_discover(),
         "pair" => cmd_pair(&args),
+        "mirror" => cmd_mirror(&args),
         "version" | "--version" | "-V" => {
             println!("airfry {}", env!("CARGO_PKG_VERSION"));
             0
@@ -39,8 +42,9 @@ fn print_help() {
          USAGE:\n  \
            airfry discover            Scan the network for AirPlay receivers\n  \
            airfry pair <host[:port]>  Connect + pair + fp-setup against a receiver\n  \
+           airfry mirror <host[:port]>  Mirror this screen to the receiver\n  \
            airfry version             Print version\n\n\
-         More subcommands (mirror) land as the pipeline is built.",
+         mirror flags: [--fit <pct>] [--bitrate <kbps>] [--fps <n>] [--pin <pin>] [--sw] [--no-encrypt]",
         env!("CARGO_PKG_VERSION")
     );
 }
@@ -95,6 +99,84 @@ fn cmd_pair(args: &[String]) -> i32 {
         }
         Err(e) => {
             eprintln!("\npairing failed: {e:#}");
+            1
+        }
+    }
+}
+
+fn cmd_mirror(args: &[String]) -> i32 {
+    let target = match args.get(2) {
+        Some(t) => t.as_str(),
+        None => {
+            eprintln!("usage: airfry mirror <host[:port]> [--fit <pct>] [--bitrate <kbps>] [--fps <n>] [--pin <pin>] [--sw] [--no-encrypt]");
+            return 2;
+        }
+    };
+    let (host, port) = match target.rsplit_once(':') {
+        Some((h, p)) => match p.parse::<u16>() {
+            Ok(port) => (h.to_string(), port),
+            Err(_) => {
+                eprintln!("invalid port in '{target}'");
+                return 2;
+            }
+        },
+        None => (target.to_string(), 7000u16),
+    };
+
+    // Parse flags after the target.
+    let mut opts = mirror::MirrorOpts::default();
+    let mut pin = String::new();
+    let mut i = 3;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--fit" => {
+                i += 1;
+                opts.fit_pct = args.get(i).and_then(|s| s.parse().ok()).unwrap_or(0);
+            }
+            "--bitrate" => {
+                i += 1;
+                opts.bitrate_kbps = args.get(i).and_then(|s| s.parse().ok()).unwrap_or(0);
+            }
+            "--fps" => {
+                i += 1;
+                opts.fps = args.get(i).and_then(|s| s.parse().ok()).unwrap_or(30);
+            }
+            "--pin" => {
+                i += 1;
+                pin = args.get(i).cloned().unwrap_or_default();
+            }
+            "--sw" => opts.force_software_encoder = true,
+            "--no-encrypt" => opts.no_encrypt = true,
+            other => {
+                eprintln!("unknown flag '{other}'");
+                return 2;
+            }
+        }
+        i += 1;
+    }
+
+    eprintln!("Connecting to {host}:{port}…");
+    let mut report = |phase: &str, ok: bool, detail: &str| {
+        let mark = if ok { "OK " } else { "FAIL" };
+        eprintln!("[{mark}] {phase}: {detail}");
+    };
+
+    let session = match rtsp::Session::connect_host_with(&host, port, &pin, &mut report) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("pairing failed: {e:#}");
+            return 1;
+        }
+    };
+    eprintln!("Session established; starting mirror.");
+
+    match mirror::run_mirror(session, opts) {
+        Ok(()) => {
+            eprintln!("mirror ended.");
+            0
+        }
+        Err(e) => {
+            eprintln!("mirror error: {e:#}");
             1
         }
     }

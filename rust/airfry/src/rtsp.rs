@@ -81,6 +81,14 @@ impl Transport {
         self.encrypted
     }
 
+    /// The receiver's (host, port) as seen on the live socket. The mirror stage
+    /// uses this to build the `rtsp://host:port/<streamConnectionID>` request
+    /// URIs that screen mirroring SETUP/RECORD requires.
+    pub fn peer_addr(&self) -> Result<(String, u16)> {
+        let pa = self.conn.peer_addr().context("socket peer addr")?;
+        Ok((pa.ip().to_string(), pa.port()))
+    }
+
     /// Enable HAP control-channel encryption with the keys derived from the
     /// pair-verify X25519 shared secret. Nonces reset to 0 (matches Go).
     pub fn enable_encryption(&mut self, write_key: Vec<u8>, read_key: Vec<u8>) {
