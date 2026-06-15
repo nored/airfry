@@ -14,8 +14,11 @@
 //!            ! video/x-h264,stream-format=byte-stream,alignment=au ! appsink
 //!   X11:     ximagesrc ! ... (same tail)
 //!
-//! Encoder selection follows capture.go's fallback chain but adapted to the
-//! task's required order: vaapih264enc -> vah264enc -> x264enc.
+//! Encoder selection follows capture.go's detectGstEncoder fallback chain
+//! exactly: vulkanh264enc (NVENC via Vulkan) -> nvh264enc (legacy NVENC) ->
+//! vah264enc (VA-API) -> x264enc, gated by an HWAccel mode
+//! ("auto"/"nvenc"/"vaapi"/"none", read from $AIRFRY_HWACCEL /
+//! $DOUBLETAKE_HWACCEL, default "auto").
 //!
 //! The capture runs on its own GStreamer thread; encoded byte chunks are pushed
 //! through an `mpsc` channel. `CaptureSource::read` reassembles them into the
@@ -62,6 +65,46 @@ impl Default for CaptureConfig {
 const DEFAULT_VIDEO_BITRATE_KBPS: u32 = 4500;
 const MIN_VIDEO_BITRATE_KBPS: u32 = 1800;
 const MAX_VIDEO_BITRATE_KBPS: u32 = 12000;
+
+/// Read an env var, trying the AIRFRY_ name first and falling back to the
+/// DOUBLETAKE_ name (the original Go reads DOUBLETAKE_*; we honor both).
+fn env_var(suffix: &str) -> Option<String> {
+    std::env::var(format!("AIRFRY_{suffix}"))
+        .ok()
+        .filter(|s| !s.is_empty())
+        .or_else(|| {
+            std::env::var(format!("DOUBLETAKE_{suffix}"))
+                .ok()
+                .filter(|s| !s.is_empty())
+        })
+}
+
+/// $DOUBLETAKE_OUTPUT_HEIGHT (applyOutputScale, capture.go:596).
+fn output_height_env() -> i32 {
+    env_var("OUTPUT_HEIGHT")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0)
+}
+
+/// $DOUBLETAKE_FIT_PCT (applyOutputScale, capture.go:613). When set it
+/// overrides any CLI-supplied fit percent, matching Go (which only reads fit
+/// from the env).
+fn fit_pct_env(cfg: &CaptureConfig) -> i32 {
+    if let Some(v) = env_var("FIT_PCT").and_then(|s| s.parse::<i32>().ok()) {
+        return v;
+    }
+    cfg.fit_pct as i32
+}
+
+/// HWAccel mode: "auto" (default), "nvenc", "vaapi", "none". Mirrors
+/// cfg.HWAccel in capture.go's detectGstEncoder. `force_software` maps to
+/// "none". Read from $AIRFRY_HWACCEL / $DOUBLETAKE_HWACCEL otherwise.
+fn hwaccel_mode(cfg: &CaptureConfig) -> String {
+    if cfg.force_software {
+        return "none".to_string();
+    }
+    env_var("HWACCEL").unwrap_or_else(|| "auto".to_string())
+}
 
 /// recommendedBitrateKbps — capture.go's auto-bitrate heuristic.
 fn recommended_bitrate_kbps(width: u32, height: u32, fps: u32) -> u32 {
@@ -113,6 +156,24 @@ impl CaptureSource {
             portal.node_id, src_w, src_h
         );
 
+        // applyOutputScale (capture.go:81): compute the encoded (target) dims
+        // and the optional videoscale segment from the portal's native size.
+        let scale = OutputScale::compute(cfg, src_w as i32, src_h as i32);
+
+        Self::build_wayland_pipeline(cfg, portal, &scale, false)
+    }
+
+    /// Build the Wayland pipeline. `force_software` forces the x264 encoder
+    /// (runtime retry path, capture.go:230-237 analogue).
+    fn build_wayland_pipeline(
+        cfg: &CaptureConfig,
+        portal: PortalSession,
+        scale: &OutputScale,
+        force_software: bool,
+    ) -> Result<CaptureSource> {
+        let fps = if cfg.fps == 0 { 30 } else { cfg.fps };
+        let pipeline = gst::Pipeline::new();
+
         // pipewiresrc wants the raw fd of the portal's PipeWire remote.
         let fd = portal.fd.as_raw_fd();
         let src = gst::ElementFactory::make("pipewiresrc")
@@ -122,59 +183,166 @@ impl CaptureSource {
             .build()
             .context("create pipewiresrc (install gst-plugin-pipewire)")?;
 
-        Self::build_pipeline(cfg, src, src_w, src_h, Some(portal))
-    }
-
-    fn start_x11(cfg: &CaptureConfig) -> Result<CaptureSource> {
-        let src = gst::ElementFactory::make("ximagesrc")
-            .property("use-damage", false)
-            .build()
-            .context("create ximagesrc (install gst-plugins-good)")?;
-        // We do not crop to the primary monitor here (capture.go uses xrandr);
-        // ximagesrc captures the full X screen. Source size is unknown → 0,0,
-        // which makes the auto-bitrate fall back to a 1080p budget.
-        Self::build_pipeline(cfg, src, 0, 0, None)
-    }
-
-    /// Build and link the shared encode tail and an appsink, then start the
-    /// pipeline and spawn the appsink pump.
-    fn build_pipeline(
-        cfg: &CaptureConfig,
-        src: gst::Element,
-        src_w: u32,
-        src_h: u32,
-        portal: Option<PortalSession>,
-    ) -> Result<CaptureSource> {
-        let fps = if cfg.fps == 0 { 30 } else { cfg.fps };
-        let pipeline = gst::Pipeline::new();
-
+        // Wayland tail (capture.go:103-110):
+        //   pipewiresrc ! videoconvert ! videorate drop-only skip-to-first
+        //   ! caps(framerate) ! queue(leaky) [! outputScale] [! vulkanupload]
+        //   ! encoder ! ...
         let videoconvert = make("videoconvert")?;
         let videorate = gst::ElementFactory::make("videorate")
             .property("drop-only", true)
             .property("skip-to-first", true)
             .build()
             .context("create videorate")?;
-        let rate_caps = gst::ElementFactory::make("capsfilter")
-            .property(
-                "caps",
-                &gst::Caps::builder("video/x-raw")
-                    .field("framerate", gst::Fraction::new(fps as i32, 1))
-                    .build(),
-            )
-            .build()
-            .context("create framerate capsfilter")?;
-        let queue = gst::ElementFactory::make("queue")
-            .property("max-size-buffers", 1u32)
-            .property("max-size-bytes", 0u32)
-            .property("max-size-time", 0u64)
-            .property_from_str("leaky", "downstream")
-            .build()
-            .context("create queue")?;
+        let rate_caps = framerate_caps(fps)?;
+        let queue = leaky_queue()?;
 
-        // Optional fit/underscan scaling stage (videoscale [+ videobox]).
-        let fit_elems = build_fit_stage(cfg.fit_pct, src_w, src_h)?;
+        let mut elems: Vec<gst::Element> = vec![
+            src.clone(),
+            videoconvert.clone(),
+            videorate.clone(),
+            rate_caps.clone(),
+            queue.clone(),
+        ];
 
-        let encoder = build_encoder(cfg, src_w, src_h, fps)?;
+        let (enc, eos, rx) = Self::finish_pipeline(
+            cfg, &pipeline, &mut elems, scale, fps, force_software,
+        )?;
+        let _ = enc;
+
+        pipeline
+            .set_state(gst::State::Playing)
+            .context("set pipeline PLAYING")?;
+
+        Ok(CaptureSource {
+            pipeline,
+            rx,
+            leftover: Vec::new(),
+            _portal: Some(portal),
+            eos,
+        })
+    }
+
+    fn start_x11(cfg: &CaptureConfig) -> Result<CaptureSource> {
+        let display = std::env::var("DISPLAY").unwrap_or_default();
+
+        // Detect primary monitor geometry — ximagesrc captures the full X screen
+        // (all monitors). Crop to the primary monitor and use its native size for
+        // auto-bitrate / fit (capture.go:179-199).
+        let (start_x, start_y, end_x, end_y) = detect_primary_monitor(&display);
+        let (src_w, src_h) = if end_x > start_x && end_y > start_y {
+            (end_x - start_x, end_y - start_y)
+        } else {
+            (0, 0)
+        };
+
+        let scale = OutputScale::compute(cfg, src_w, src_h);
+
+        Self::build_x11_pipeline(cfg, &display, start_x, start_y, end_x, end_y, &scale, false)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn build_x11_pipeline(
+        cfg: &CaptureConfig,
+        display: &str,
+        start_x: i32,
+        start_y: i32,
+        end_x: i32,
+        end_y: i32,
+        scale: &OutputScale,
+        force_software: bool,
+    ) -> Result<CaptureSource> {
+        let fps = if cfg.fps == 0 { 30 } else { cfg.fps };
+        let pipeline = gst::Pipeline::new();
+
+        // ximagesrc display-name=<display> use-damage=false [crop to monitor].
+        let mut src_b = gst::ElementFactory::make("ximagesrc")
+            .property("display-name", display)
+            .property("use-damage", false);
+        if end_x > start_x && end_y > start_y {
+            src_b = src_b
+                .property("startx", start_x as u32)
+                .property("starty", start_y as u32)
+                .property("endx", (end_x - 1) as u32)
+                .property("endy", (end_y - 1) as u32);
+            eprintln!(
+                "[capture] cropping ximagesrc to x={}..{} y={}..{}",
+                start_x,
+                end_x - 1,
+                start_y,
+                end_y - 1
+            );
+        }
+        let src = src_b
+            .build()
+            .context("create ximagesrc (install gst-plugins-good)")?;
+
+        // X11 tail (capture.go:202-207):
+        //   ximagesrc ! caps(framerate) ! queue(leaky) ! videoconvert
+        //   [! outputScale] [! vulkanupload] ! encoder ! ...
+        // NOTE: no videorate on X11 (unlike Wayland).
+        let rate_caps = framerate_caps(fps)?;
+        let queue = leaky_queue()?;
+        let videoconvert = make("videoconvert")?;
+
+        let mut elems: Vec<gst::Element> = vec![
+            src.clone(),
+            rate_caps.clone(),
+            queue.clone(),
+            videoconvert.clone(),
+        ];
+
+        let (enc, eos, rx) = Self::finish_pipeline(
+            cfg, &pipeline, &mut elems, scale, fps, force_software,
+        )?;
+
+        // Runtime start-failure retry (capture.go:230-237): if a Vulkan encoder
+        // pipeline fails to reach PLAYING, fall back to software (x264).
+        let needs_vulkan = enc.factory().map(|f| f.name() == "vulkanh264enc").unwrap_or(false);
+        let started = pipeline.set_state(gst::State::Playing);
+        match started {
+            Ok(_) => Ok(CaptureSource {
+                pipeline,
+                rx,
+                leftover: Vec::new(),
+                _portal: None,
+                eos,
+            }),
+            Err(e) => {
+                let _ = pipeline.set_state(gst::State::Null);
+                if needs_vulkan && !force_software {
+                    eprintln!("[capture] vulkanh264enc pipeline failed, falling back to x264enc");
+                    Self::build_x11_pipeline(
+                        cfg, display, start_x, start_y, end_x, end_y, scale, true,
+                    )
+                } else {
+                    Err(e).context("set pipeline PLAYING")
+                }
+            }
+        }
+    }
+
+    /// Append the optional output-scale stage, the (optional vulkanupload +)
+    /// encoder, h264parse, the byte-stream caps, and an appsink; add+link the
+    /// whole element list; wire the appsink pump. Returns the chosen encoder,
+    /// the EOS flag, and the byte-stream receiver. Does NOT start the pipeline
+    /// (the caller decides, so the X11 retry can observe a failed start).
+    fn finish_pipeline(
+        cfg: &CaptureConfig,
+        pipeline: &gst::Pipeline,
+        elems: &mut Vec<gst::Element>,
+        scale: &OutputScale,
+        fps: u32,
+        force_software: bool,
+    ) -> Result<(gst::Element, Arc<Mutex<bool>>, Receiver<Vec<u8>>)> {
+        // Optional output-scale stage (videoscale [+ videobox]) — applies the
+        // OUTPUT_HEIGHT rescale and/or the fit/underscan border.
+        elems.extend(build_output_scale_stage(scale)?);
+
+        let (encoder, needs_vulkan) = build_encoder(cfg, scale, fps, force_software)?;
+        if needs_vulkan {
+            elems.push(make("vulkanupload")?);
+        }
+        elems.push(encoder.clone());
 
         let h264parse = gst::ElementFactory::make("h264parse")
             .property("config-interval", -1i32)
@@ -197,27 +365,16 @@ impl CaptureSource {
             .drop(false)
             .build();
 
-        // Assemble element list in order.
-        let mut elems: Vec<gst::Element> = vec![
-            src.clone(),
-            videoconvert.clone(),
-            videorate.clone(),
-            rate_caps.clone(),
-            queue.clone(),
-        ];
-        elems.extend(fit_elems.iter().cloned());
-        elems.push(encoder.clone());
-        elems.push(h264parse.clone());
-        elems.push(parse_caps.clone());
+        elems.push(h264parse);
+        elems.push(parse_caps);
         elems.push(appsink.upcast_ref::<gst::Element>().clone());
 
-        for e in &elems {
+        for e in elems.iter() {
             pipeline.add(e).context("add element to pipeline")?;
         }
         gst::Element::link_many(elems.iter().collect::<Vec<_>>().as_slice())
             .context("link pipeline")?;
 
-        // appsink pump: push each encoded buffer's bytes down the channel.
         let (tx, rx): (Sender<Vec<u8>>, Receiver<Vec<u8>>) = mpsc::channel();
         let eos = Arc::new(Mutex::new(false));
         let eos_cb = eos.clone();
@@ -227,8 +384,6 @@ impl CaptureSource {
                     let sample = sink.pull_sample().map_err(|_| gst::FlowError::Eos)?;
                     if let Some(buffer) = sample.buffer() {
                         if let Ok(map) = buffer.map_readable() {
-                            // Channel send failure means the consumer dropped;
-                            // signal EOS upstream so the pipeline can wind down.
                             if tx.send(map.as_slice().to_vec()).is_err() {
                                 return Err(gst::FlowError::Eos);
                             }
@@ -242,17 +397,7 @@ impl CaptureSource {
                 .build(),
         );
 
-        pipeline
-            .set_state(gst::State::Playing)
-            .context("set pipeline PLAYING")?;
-
-        Ok(CaptureSource {
-            pipeline,
-            rx,
-            leftover: Vec::new(),
-            _portal: portal,
-            eos,
-        })
+        Ok((encoder, eos, rx))
     }
 
     /// Fill `buf` with the next chunk of the Annex-B H.264 byte-stream, the
@@ -297,101 +442,253 @@ fn make(name: &str) -> Result<gst::Element> {
         .with_context(|| format!("create {name}"))
 }
 
-/// build_fit_stage — the videoscale/videobox segment for the fit/underscan
-/// percentage, mirroring capture.go's applyOutputScale fit branch. Needs the
-/// source size; if it is unknown (0) we can only pass through (no fit), since
-/// the absolute videobox borders depend on the frame size.
-fn build_fit_stage(fit_pct: u8, src_w: u32, src_h: u32) -> Result<Vec<gst::Element>> {
-    if fit_pct == 0 || src_w == 0 || src_h == 0 {
-        return Ok(Vec::new());
-    }
-    let mut fit = fit_pct as i32;
-    if fit > 25 {
-        fit = 25;
-    }
-    let tw = src_w as i32;
-    let th = src_h as i32;
-    let mut cw = tw * (100 - fit) / 100;
-    let mut ch = th * (100 - fit) / 100;
-    cw -= cw % 2;
-    ch -= ch % 2;
-    let bx = (tw - cw) / 2;
-    let by = (th - ch) / 2;
-
-    let videoscale = make("videoscale")?;
-    let scale_caps = gst::ElementFactory::make("capsfilter")
+/// `! video/x-raw,framerate=<fps>/1`.
+fn framerate_caps(fps: u32) -> Result<gst::Element> {
+    gst::ElementFactory::make("capsfilter")
         .property(
             "caps",
             &gst::Caps::builder("video/x-raw")
-                .field("width", cw)
-                .field("height", ch)
+                .field("framerate", gst::Fraction::new(fps as i32, 1))
                 .build(),
         )
         .build()
-        .context("create fit scale capsfilter")?;
-    // videobox with negative borders pads (adds) pixels; matches capture.go's
-    // left/right/top/bottom = -bx/-by with fill=black.
-    let videobox = gst::ElementFactory::make("videobox")
-        .property_from_str("fill", "black")
-        .property("autocrop", false)
-        .property("left", -bx)
-        .property("right", -bx)
-        .property("top", -by)
-        .property("bottom", -by)
-        .build()
-        .context("create videobox")?;
-    let box_caps = gst::ElementFactory::make("capsfilter")
-        .property(
-            "caps",
-            &gst::Caps::builder("video/x-raw")
-                .field("width", tw)
-                .field("height", th)
-                .build(),
-        )
-        .build()
-        .context("create fit out capsfilter")?;
-
-    eprintln!(
-        "[capture] fit {fit}%: desktop {cw}x{ch} centered in {tw}x{th} frame (border {bx}/{by})"
-    );
-    Ok(vec![videoscale, scale_caps, videobox, box_caps])
+        .context("create framerate capsfilter")
 }
 
-/// build_encoder — runtime encoder selection with the required fallback chain:
-/// vaapih264enc -> vah264enc -> x264enc. Configures low-latency CBR and a
-/// keyframe interval, matching the spirit of capture.go's detectGstEncoder.
+/// `! queue max-size-buffers=1 max-size-bytes=0 max-size-time=0 leaky=downstream`.
+fn leaky_queue() -> Result<gst::Element> {
+    gst::ElementFactory::make("queue")
+        .property("max-size-buffers", 1u32)
+        .property("max-size-bytes", 0u32)
+        .property("max-size-time", 0u64)
+        .property_from_str("leaky", "downstream")
+        .build()
+        .context("create queue")
+}
+
+/// OutputScale — the result of applyOutputScale (capture.go:587-641).
+/// `enc_w`/`enc_h` are the ENCODED (target) dimensions used to size the bitrate
+/// and SPS; `scale_args` describes the videoscale (+ videobox) stage, or None
+/// for native passthrough.
+struct OutputScale {
+    enc_w: i32,
+    enc_h: i32,
+    scale_args: Option<ScaleArgs>,
+}
+
+/// Concrete params for the videoscale/videobox stage.
+enum ScaleArgs {
+    /// `videoscale ! caps(w,h)` — plain rescale, no border.
+    Plain { w: i32, h: i32 },
+    /// `videoscale ! caps(cw,ch) ! videobox(borders) ! caps(tw,th)` — fit/underscan.
+    Fit {
+        cw: i32,
+        ch: i32,
+        tw: i32,
+        th: i32,
+        bx: i32,
+        by: i32,
+    },
+}
+
+impl OutputScale {
+    /// applyOutputScale (capture.go:587). `src_w`/`src_h` are the native source
+    /// dimensions (0 → unknown). Computes the encoded size (native, or scaled to
+    /// $OUTPUT_HEIGHT) and the videoscale/videobox segment, with the fit border
+    /// applied to the POST-scale dims.
+    fn compute(cfg: &CaptureConfig, src_w: i32, src_h: i32) -> OutputScale {
+        if src_w <= 0 || src_h <= 0 {
+            return OutputScale {
+                enc_w: src_w,
+                enc_h: src_h,
+                scale_args: None,
+            };
+        }
+
+        // Encoded frame size: native, or scaled to $OUTPUT_HEIGHT.
+        let mut tw = src_w;
+        let mut th = src_h;
+        let oh = output_height_env();
+        if oh > 0 {
+            th = oh;
+            tw = src_w * oh / src_h;
+        }
+        tw -= tw % 2;
+        th -= th % 2;
+        if tw <= 0 || th <= 0 {
+            return OutputScale {
+                enc_w: src_w,
+                enc_h: src_h,
+                scale_args: None,
+            };
+        }
+
+        let enc_w = tw;
+        let enc_h = th;
+
+        let mut fit = fit_pct_env(cfg);
+        let scaled = tw != src_w || th != src_h;
+
+        if fit <= 0 && !scaled {
+            // native passthrough — nothing to do.
+            return OutputScale {
+                enc_w,
+                enc_h,
+                scale_args: None,
+            };
+        }
+        if fit <= 0 {
+            return OutputScale {
+                enc_w,
+                enc_h,
+                scale_args: Some(ScaleArgs::Plain { w: tw, h: th }),
+            };
+        }
+        if fit > 25 {
+            fit = 25;
+        }
+        let mut cw = tw * (100 - fit) / 100;
+        let mut ch = th * (100 - fit) / 100;
+        cw -= cw % 2;
+        ch -= ch % 2;
+        let bx = (tw - cw) / 2;
+        let by = (th - ch) / 2;
+        eprintln!(
+            "[capture] fit {fit}%: desktop {cw}x{ch} centered in {tw}x{th} frame (border {bx}/{by})"
+        );
+        OutputScale {
+            enc_w,
+            enc_h,
+            scale_args: Some(ScaleArgs::Fit {
+                cw,
+                ch,
+                tw,
+                th,
+                bx,
+                by,
+            }),
+        }
+    }
+}
+
+fn raw_caps(w: i32, h: i32) -> Result<gst::Element> {
+    gst::ElementFactory::make("capsfilter")
+        .property(
+            "caps",
+            &gst::Caps::builder("video/x-raw")
+                .field("width", w)
+                .field("height", h)
+                .build(),
+        )
+        .build()
+        .context("create video/x-raw capsfilter")
+}
+
+/// build_output_scale_stage — turn an OutputScale into the videoscale (+ videobox)
+/// element chain, the in-process analogue of outputScaleArgs.
+fn build_output_scale_stage(scale: &OutputScale) -> Result<Vec<gst::Element>> {
+    match &scale.scale_args {
+        None => Ok(Vec::new()),
+        Some(ScaleArgs::Plain { w, h }) => {
+            Ok(vec![make("videoscale")?, raw_caps(*w, *h)?])
+        }
+        Some(ScaleArgs::Fit {
+            cw,
+            ch,
+            tw,
+            th,
+            bx,
+            by,
+        }) => {
+            let videoscale = make("videoscale")?;
+            let scale_caps = raw_caps(*cw, *ch)?;
+            // videobox with negative borders pads (adds) pixels; matches
+            // capture.go's left/right/top/bottom = -bx/-by with fill=black.
+            let videobox = gst::ElementFactory::make("videobox")
+                .property_from_str("fill", "black")
+                .property("autocrop", false)
+                .property("left", -*bx)
+                .property("right", -*bx)
+                .property("top", -*by)
+                .property("bottom", -*by)
+                .build()
+                .context("create videobox")?;
+            let box_caps = raw_caps(*tw, *th)?;
+            Ok(vec![videoscale, scale_caps, videobox, box_caps])
+        }
+    }
+}
+
+/// captureBitrateKbps — capture.go:643. Sized from the ENCODED dims (post-scale).
+fn capture_bitrate_kbps(cfg: &CaptureConfig, scale: &OutputScale, fps: u32) -> u32 {
+    if cfg.bitrate_kbps > 0 {
+        return cfg.bitrate_kbps;
+    }
+    let (w, h) = if scale.enc_w > 0 && scale.enc_h > 0 {
+        (scale.enc_w as u32, scale.enc_h as u32)
+    } else {
+        (1920, 1080)
+    };
+    let b = recommended_bitrate_kbps(w, h, fps);
+    eprintln!("[capture] auto bitrate selected: {b} kbps for {w}x{h}@{fps}fps");
+    b
+}
+
+/// build_encoder — detectGstEncoder (capture.go:400-482). Probes encoders in
+/// priority order, gated by the HWAccel mode: vulkanh264enc (NVENC via Vulkan)
+/// -> nvh264enc (legacy NVENC) -> vah264enc (VA-API) -> x264enc. Returns the
+/// encoder and whether it needs a `vulkanupload` stage before it.
+///
+/// `force_software` (runtime retry) collapses the mode to "none".
 fn build_encoder(
     cfg: &CaptureConfig,
-    src_w: u32,
-    src_h: u32,
+    scale: &OutputScale,
     fps: u32,
-) -> Result<gst::Element> {
-    let bitrate = if cfg.bitrate_kbps > 0 {
-        cfg.bitrate_kbps
-    } else {
-        let (w, h) = if src_w > 0 && src_h > 0 {
-            (src_w, src_h)
-        } else {
-            (1920, 1080)
-        };
-        let b = recommended_bitrate_kbps(w, h, fps);
-        eprintln!("[capture] auto bitrate: {b} kbps for {w}x{h}@{fps}fps");
-        b
-    };
+    force_software: bool,
+) -> Result<(gst::Element, bool)> {
+    let bitrate = capture_bitrate_kbps(cfg, scale, fps);
     let key_int = keyframe_interval_frames(fps);
+    let hwaccel = if force_software {
+        "none".to_string()
+    } else {
+        hwaccel_mode(cfg)
+    };
 
-    if !cfg.force_software {
-        // vaapih264enc (legacy VA-API). bitrate in kbps; keyframe-period frames.
-        if let Ok(enc) = gst::ElementFactory::make("vaapih264enc")
-            .property("bitrate", bitrate)
-            .property("keyframe-period", key_int)
+    // Try Vulkan H.264 (NVENC via Vulkan API).
+    if hwaccel == "auto" || hwaccel == "nvenc" {
+        if let Ok(enc) = gst::ElementFactory::make("vulkanh264enc")
+            .property("b-frames", 0u32)
+            .property("idr-period", key_int)
             .property_from_str("rate-control", "cbr")
+            .property("bitrate", bitrate)
             .build()
         {
-            eprintln!("[capture] encoder: vaapih264enc (bitrate={bitrate} kbps)");
-            return Ok(enc);
+            eprintln!("[CAPTURE] using NVENC hardware encoding (vulkanh264enc)");
+            return Ok((enc, true));
         }
-        // vah264enc (newer VA-API). bitrate in kbps; key-int-max in frames.
+    }
+
+    // Try legacy NVENC.
+    if hwaccel == "auto" || hwaccel == "nvenc" {
+        if let Ok(enc) = gst::ElementFactory::make("nvh264enc")
+            .property("bitrate", bitrate)
+            .property("gop-size", key_int as i32)
+            .property("bframes", 0u32)
+            .property_from_str("rc-mode", "cbr")
+            .property_from_str("preset", "low-latency-hq")
+            .property("zerolatency", true)
+            .build()
+        {
+            eprintln!("[CAPTURE] using NVENC hardware encoding (nvh264enc)");
+            return Ok((enc, false));
+        }
+        if hwaccel == "nvenc" {
+            eprintln!("[CAPTURE] nvh264enc not available, falling back to software");
+        }
+    }
+
+    // Try VAAPI (vah264enc).
+    if hwaccel == "auto" || hwaccel == "vaapi" {
         if let Ok(enc) = gst::ElementFactory::make("vah264enc")
             .property("bitrate", bitrate)
             .property("key-int-max", key_int)
@@ -399,20 +696,26 @@ fn build_encoder(
             .property_from_str("rate-control", "cbr")
             .build()
         {
-            eprintln!("[capture] encoder: vah264enc (bitrate={bitrate} kbps)");
-            return Ok(enc);
+            eprintln!("[CAPTURE] using VAAPI hardware encoding (vah264enc)");
+            return Ok((enc, false));
+        }
+        if hwaccel == "vaapi" {
+            eprintln!("[CAPTURE] vah264enc not available, falling back to software");
         }
     }
 
     // Software fallback: x264enc, low-latency, no B-frames, Annex-B + AUDs.
     let vbv = vbv_buffer_kbit(bitrate, fps);
-    let maxrate = bitrate + bitrate / 4;
+    let maxrate = bitrate + bitrate / 4; // allow 25% overshoot on peaks
     let enc = gst::ElementFactory::make("x264enc")
         .property_from_str("tune", "zerolatency")
         .property_from_str("speed-preset", "superfast")
         .property("bitrate", bitrate)
         .property("vbv-buf-capacity", vbv)
         .property("key-int-max", key_int)
+        // pass=0 (VBR). The gst enum value "qual" / "pass1"... — Go uses pass=0,
+        // which is the "cbr"/constant-quality default enum; the audit confirms
+        // pass=0 and pass=cbr resolve to the same enum value.
         .property_from_str("pass", "cbr")
         .property("option-string", format!("vbv-maxrate={maxrate}"))
         .property("b-frames", 0u32)
@@ -421,8 +724,99 @@ fn build_encoder(
         .property("aud", true)
         .build()
         .context("create x264enc (install gst-plugins-ugly / libx264)")?;
-    eprintln!("[capture] encoder: x264enc software (bitrate={bitrate} kbps)");
-    Ok(enc)
+    eprintln!("[CAPTURE] using software encoding (x264enc) bitrate={bitrate} kbps");
+    Ok((enc, false))
+}
+
+/// detect_primary_monitor — detectPrimaryMonitor (capture.go:305). Queries
+/// xrandr for the primary monitor geometry. Returns (start_x, start_y, end_x,
+/// end_y); all zeros if detection fails (no cropping).
+fn detect_primary_monitor(display: &str) -> (i32, i32, i32, i32) {
+    let out = std::process::Command::new("xrandr")
+        .arg("--display")
+        .arg(display)
+        .arg("--query")
+        .output();
+    let out = match out {
+        Ok(o) if o.status.success() => o.stdout,
+        _ => {
+            eprintln!("[capture] xrandr failed, skipping monitor crop");
+            return (0, 0, 0, 0);
+        }
+    };
+    let text = String::from_utf8_lossy(&out);
+
+    let mut geom: Option<(i32, i32, i32, i32)> = None; // (x,y,w,h)
+    // Try primary first.
+    for line in text.lines() {
+        if !line.contains(" connected") {
+            continue;
+        }
+        if line.contains(" primary ") {
+            if let Some(g) = parse_xrandr_geometry(line) {
+                geom = Some(g);
+                break;
+            }
+        }
+    }
+    // Else first connected output.
+    if geom.is_none() {
+        for line in text.lines() {
+            if !line.contains(" connected") {
+                continue;
+            }
+            if let Some(g) = parse_xrandr_geometry(line) {
+                geom = Some(g);
+                break;
+            }
+        }
+    }
+
+    match geom {
+        Some((x, y, w, h)) if w > 0 && h > 0 => {
+            eprintln!("[capture] primary monitor: {w}x{h} at +{x}+{y}");
+            (x, y, x + w, y + h)
+        }
+        _ => {
+            eprintln!("[capture] couldn't parse xrandr output, skipping monitor crop");
+            (0, 0, 0, 0)
+        }
+    }
+}
+
+/// parse_xrandr_geometry — parseXrandrGeometry (capture.go:356). Extracts
+/// (x, y, w, h) from a `WxH+X+Y` field in an xrandr output line.
+fn parse_xrandr_geometry(line: &str) -> Option<(i32, i32, i32, i32)> {
+    for field in line.split_whitespace() {
+        // e.g. "1920x1080+0+0" or "3840x2160+1920+0".
+        let (w_str, rest) = match field.split_once('x') {
+            Some(parts) => parts,
+            None => continue,
+        };
+        let w: i32 = match w_str.parse() {
+            Ok(w) if w >= 640 => w,
+            _ => continue,
+        };
+        // rest e.g. "1080+0+0".
+        let plus: Vec<&str> = rest.splitn(3, '+').collect();
+        if plus.len() != 3 {
+            continue;
+        }
+        let h: i32 = match plus[0].parse() {
+            Ok(h) => h,
+            Err(_) => continue,
+        };
+        let x: i32 = match plus[1].parse() {
+            Ok(x) => x,
+            Err(_) => continue,
+        };
+        let y: i32 = match plus[2].parse() {
+            Ok(y) => y,
+            Err(_) => continue,
+        };
+        return Some((x, y, w, h));
+    }
+    None
 }
 
 /// vbvBufferKbit — capture.go: ~2 frames of data, floored at 200.

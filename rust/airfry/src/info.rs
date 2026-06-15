@@ -27,17 +27,28 @@ pub struct DisplayInfo {
     pub height_pixels: i64,
 }
 
-/// The subset of GET /info we consume. Mirrors the Go `ReceiverInfo` fields the
-/// connection path actually reads (identity key, features, display geometry).
+/// The capabilities returned by GET /info. Mirrors the Go `ReceiverInfo`
+/// (client.go:24-43) field-for-field, with the same plist keys.
 #[derive(Default, Clone, Debug)]
 pub struct ReceiverInfo {
     pub name: String,
     pub model: String,
+    pub manufacturer: String,
+    pub device_id: String,
+    pub protocol_version: String,
     pub source_version: String,
     pub features: u64,
     pub status_flags: u64,
     /// Receiver ed25519 long-term public key (`pk`); empty if not advertised.
     pub pk: Vec<u8>,
+    pub has_udp_mirror: bool,
+    pub hdr_capability: String,
+    pub volume_control_type: i64,
+    pub initial_volume: f64,
+    pub keep_alive_body: bool,
+    pub psi: String,
+    pub pi: String,
+    pub mac_address: String,
     pub displays: Vec<DisplayInfo>,
 }
 
@@ -60,6 +71,26 @@ impl ReceiverInfo {
             return (0, 0);
         }
         (w as u32, h as u32)
+    }
+
+    /// Whether the receiver advertises FairPlay SAP (feature bit 14). Port of
+    /// `(*ReceiverInfo).SupportsFairPlaySAP` (discovery.go:161-163). This gates
+    /// the playout latency floor (modern Apple receivers set it; Roku/3rd-party
+    /// implementations do not).
+    pub fn supports_fairplay_sap(&self) -> bool {
+        self.features & crate::discovery::FEATURE_FPSAP25 != 0
+    }
+
+    /// Minimum playout lead this receiver needs. Port of
+    /// `(*ReceiverInfo).playoutLatencyFloor` (discovery.go:170-175): 0 when the
+    /// receiver advertises FairPlay SAP (robust jitter buffers, can play at very
+    /// low latency), else the conservative 500ms floor.
+    pub fn playout_latency_floor(&self) -> std::time::Duration {
+        if self.supports_fairplay_sap() {
+            std::time::Duration::ZERO
+        } else {
+            crate::latency::CONSERVATIVE_PLAYOUT_LATENCY
+        }
     }
 }
 
@@ -89,6 +120,15 @@ fn parse_info(body: &[u8]) -> Result<ReceiverInfo> {
     if let Some(s) = dict.get("model").and_then(|v| v.as_string()) {
         info.model = s.to_string();
     }
+    if let Some(s) = dict.get("manufacturer").and_then(|v| v.as_string()) {
+        info.manufacturer = s.to_string();
+    }
+    if let Some(s) = dict.get("deviceID").and_then(|v| v.as_string()) {
+        info.device_id = s.to_string();
+    }
+    if let Some(s) = dict.get("protocolVersion").and_then(|v| v.as_string()) {
+        info.protocol_version = s.to_string();
+    }
     if let Some(s) = dict.get("sourceVersion").and_then(|v| v.as_string()) {
         info.source_version = s.to_string();
     }
@@ -100,6 +140,33 @@ fn parse_info(body: &[u8]) -> Result<ReceiverInfo> {
     }
     if let Some(Value::Data(d)) = dict.get("pk") {
         info.pk = d.clone();
+    }
+    if let Some(b) = dict.get("hasUDPMirroringSupport").and_then(|v| v.as_boolean()) {
+        info.has_udp_mirror = b;
+    }
+    if let Some(s) = dict.get("receiverHDRCapability").and_then(|v| v.as_string()) {
+        info.hdr_capability = s.to_string();
+    }
+    if let Some(n) = dict.get("volumeControlType").and_then(as_i64) {
+        info.volume_control_type = n;
+    }
+    if let Some(f) = dict.get("initialVolume").and_then(|v| v.as_real()) {
+        info.initial_volume = f;
+    }
+    if let Some(b) = dict
+        .get("keepAliveSendStatsAsBody")
+        .and_then(|v| v.as_boolean())
+    {
+        info.keep_alive_body = b;
+    }
+    if let Some(s) = dict.get("psi").and_then(|v| v.as_string()) {
+        info.psi = s.to_string();
+    }
+    if let Some(s) = dict.get("pi").and_then(|v| v.as_string()) {
+        info.pi = s.to_string();
+    }
+    if let Some(s) = dict.get("macAddress").and_then(|v| v.as_string()) {
+        info.mac_address = s.to_string();
     }
 
     if let Some(arr) = dict.get("displays").and_then(|v| v.as_array()) {

@@ -17,15 +17,18 @@
 //! // hand sink1 / sink2 to two mirror sessions; each reads like a CaptureSource.
 //! ```
 //!
-//! Go uses an `io.Pipe` per sink (blocking reads, EOF on close, write error on a
-//! closed pipe). We reproduce those semantics with one `mpsc` channel of byte
-//! chunks per sink plus a closed flag: `read` blocks for the next chunk, returns
-//! 0 at EOF, and `write` fails once the sink is closed so `run` can drop it.
+//! Go uses an `io.Pipe` per sink: blocking reads, EOF on close, write error on a
+//! closed pipe, and crucially BACK-PRESSURE — `pw.Write` blocks until the reader
+//! consumes, so a slow sink throttles the pump instead of letting bytes pile up
+//! in unbounded memory. We reproduce those semantics with a BOUNDED
+//! `sync_channel` of byte chunks per sink plus a closed flag: `read` blocks for
+//! the next chunk, returns 0 at EOF, and `write` blocks on a full channel (the
+//! back-pressure) and fails once the sink is closed so `run` can drop it.
 
 #![allow(dead_code)]
 
-use std::sync::mpsc::{self, Receiver, Sender};
-use std::sync::{Arc, Mutex};
+use std::sync::mpsc::{self, Receiver, SyncSender};
+use std::sync::{Arc, Condvar, Mutex};
 
 use anyhow::{bail, Result};
 
@@ -43,6 +46,16 @@ pub struct BroadcastSink {
     /// Bytes left over from the previous read that did not fit the caller buf,
     /// mirroring `CaptureSource`'s leftover handling.
     leftover: Vec<u8>,
+    /// Shared closed flag (also set by `run`/`remove_sink` on the writer side).
+    /// Dropping the BroadcastSink marks the sink closed so the pump removes it,
+    /// mirroring Go where the reader half closing breaks the pipe.
+    closed: Arc<Mutex<bool>>,
+}
+
+impl Drop for BroadcastSink {
+    fn drop(&mut self) {
+        *self.closed.lock().unwrap() = true;
+    }
 }
 
 impl BroadcastSink {
@@ -69,15 +82,27 @@ impl BroadcastSink {
 }
 
 /// One registered sink as seen from the `BroadcastCapture` (writer) side: its
-/// sender (kept alive so the reader's `recv` blocks rather than EOF-ing) plus a
-/// shared closed flag and an identity tag for `remove_sink`.
+/// BOUNDED sender (a slow reader makes `send` block — the back-pressure that
+/// Go's `io.Pipe` provides) plus a shared closed flag and an identity tag for
+/// `remove_sink`. Cloneable so the pump can snapshot the live set under the lock
+/// and then `write` (possibly blocking) without holding the sinks lock — exactly
+/// like Go copies the slice before writing.
+#[derive(Clone)]
 struct SinkHandle {
     id: u64,
-    tx: Sender<Vec<u8>>,
+    tx: SyncSender<Vec<u8>>,
     closed: Arc<Mutex<bool>>,
 }
 
+/// Per-sink bounded channel capacity. Go's `io.Pipe` is effectively a rendezvous
+/// (capacity ~0); we use a small buffer so the pump isn't fully serialized on
+/// every read but a persistently slow sink still applies back-pressure.
+const SINK_CHANNEL_CAP: usize = 4;
+
 impl SinkHandle {
+    /// write — `bc.write`/`pw.Write` analogue. Returns Err once the sink is
+    /// closed (Go's `io.ErrClosedPipe`) or its reader is gone. Blocks while the
+    /// bounded channel is full (back-pressure).
     fn write(&self, chunk: &[u8]) -> Result<()> {
         if *self.closed.lock().unwrap() {
             bail!("broadcast sink closed");
@@ -96,8 +121,11 @@ impl SinkHandle {
 /// Shared `run`/`done`/`err` state.
 struct Shared {
     sinks: Mutex<Vec<SinkHandle>>,
-    /// Set true once `run` has finished (Go's closed `done` channel).
+    /// Set true once `run` has finished (Go's closed `done` channel). Paired
+    /// with `done_cv` so callers can block until the pump finishes, matching
+    /// Go's `Done() <-chan struct{}`.
     done: Mutex<bool>,
+    done_cv: Condvar,
     /// The error that ended `run`, if any (Go's `err` field).
     err: Mutex<Option<String>>,
     next_id: Mutex<u64>,
@@ -118,6 +146,7 @@ impl BroadcastCapture {
             shared: Arc::new(Shared {
                 sinks: Mutex::new(Vec::new()),
                 done: Mutex::new(false),
+                done_cv: Condvar::new(),
                 err: Mutex::new(None),
                 next_id: Mutex::new(0),
             }),
@@ -127,7 +156,9 @@ impl BroadcastCapture {
     /// AddSink — register a new fan-out reader. Must be called before `run`
     /// (or concurrently; the sink simply starts receiving from the next chunk).
     pub fn add_sink(&self) -> BroadcastSink {
-        let (tx, rx) = mpsc::channel::<Vec<u8>>();
+        // BOUNDED channel → a slow reader applies back-pressure to the pump,
+        // like Go's blocking io.Pipe.
+        let (tx, rx) = mpsc::sync_channel::<Vec<u8>>(SINK_CHANNEL_CAP);
         let closed = Arc::new(Mutex::new(false));
         let id = {
             let mut n = self.shared.next_id.lock().unwrap();
@@ -135,22 +166,37 @@ impl BroadcastCapture {
             *n += 1;
             id
         };
-        // The SinkHandle holds the only Sender; dropping it closes the channel
-        // and EOFs the reader. The sink itself keeps just the Receiver.
         self.shared.sinks.lock().unwrap().push(SinkHandle {
             id,
             tx,
-            closed,
+            closed: closed.clone(),
         });
         BroadcastSink {
             rx,
             leftover: Vec::new(),
+            closed,
         }
     }
 
-    /// RemoveSink — close and unregister a sink so it no longer receives data.
-    /// Identified by the writer-side handle id captured when it was added; here
-    /// we expose removal by the same identity the run loop uses internally.
+    /// RemoveSink — close and unregister a sink so it no longer receives data
+    /// (Go's `RemoveSink`, capture_broadcast.go:59-69). Identified by the
+    /// `BroadcastSink`'s id (the reader half), matching the identity the pump
+    /// uses internally. Safe to call concurrently with `run`.
+    pub fn remove_sink(&self, sink: &BroadcastSink) {
+        // Mark the reader-side closed so a blocked `write` errors out and the
+        // pump drops it; also remove its handle eagerly.
+        *sink.closed.lock().unwrap() = true;
+        let mut sinks = self.shared.sinks.lock().unwrap();
+        if let Some(pos) = sinks
+            .iter()
+            .position(|s| Arc::ptr_eq(&s.closed, &sink.closed))
+        {
+            sinks[pos].close();
+            sinks.remove(pos);
+        }
+    }
+
+    /// Internal removal-by-id used by the pump when a write fails.
     fn remove_sink_id(shared: &Shared, id: u64) {
         let mut sinks = shared.sinks.lock().unwrap();
         if let Some(pos) = sinks.iter().position(|s| s.id == id) {
@@ -178,6 +224,7 @@ impl BroadcastCapture {
             *shared.err.lock().unwrap() = Some(e.to_string());
         }
         *shared.done.lock().unwrap() = true;
+        shared.done_cv.notify_all();
         result
     }
 
@@ -188,27 +235,22 @@ impl BroadcastCapture {
         loop {
             let n = src.read(&mut buf)?;
             if n > 0 {
-                // Snapshot the sink ids+handles under the lock, then write.
-                let to_write: Vec<u64> = {
+                // Snapshot the live sink HANDLES under the lock, then release it
+                // and write — `write` may block (back-pressure) and must not hold
+                // the sinks lock, exactly like Go copies the slice before writing.
+                let snapshot: Vec<SinkHandle> = {
                     let sinks = shared.sinks.lock().unwrap();
-                    sinks.iter().map(|s| s.id).collect()
+                    sinks.clone()
                 };
-                if to_write.is_empty() {
+                if snapshot.is_empty() {
                     // No active sinks; keep draining so capture never blocks.
                     continue;
                 }
                 let chunk = &buf[..n];
-                for id in to_write {
-                    let write_err = {
-                        let sinks = shared.sinks.lock().unwrap();
-                        match sinks.iter().find(|s| s.id == id) {
-                            Some(s) => s.write(chunk).is_err(),
-                            None => false,
-                        }
-                    };
-                    if write_err {
+                for s in snapshot {
+                    if s.write(chunk).is_err() {
                         // Sink is closed or broken; remove it.
-                        Self::remove_sink_id(shared, id);
+                        Self::remove_sink_id(shared, s.id);
                     }
                 }
             }
@@ -226,6 +268,21 @@ impl BroadcastCapture {
         *self.shared.done.lock().unwrap()
     }
 
+    /// WaitDone — block until `run` has finished, the awaitable analogue of
+    /// Go's `Done() <-chan struct{}` (`<-bc.Done()`).
+    pub fn wait_done(&self) {
+        let mut done = self.shared.done.lock().unwrap();
+        while !*done {
+            done = self.shared.done_cv.wait(done).unwrap();
+        }
+    }
+
+    /// Source — the underlying `CaptureSource` (Go's `Source()`). Returns the
+    /// guard since the capture lives behind a mutex here.
+    pub fn source(&self) -> std::sync::MutexGuard<'_, CaptureSource> {
+        self.src.lock().unwrap()
+    }
+
     /// Err — the error that caused `run` to exit, or None if still running /
     /// finished cleanly (Go's `Err`).
     pub fn err(&self) -> Option<String> {
@@ -240,7 +297,7 @@ impl BroadcastCapture {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::mpsc::{Receiver, Sender};
+    use std::sync::mpsc::{self, Receiver, Sender};
 
     /// A minimal in-memory source that satisfies the same `read` contract as
     /// `CaptureSource` (fills buf, 0 == EOF), used to exercise the fan-out logic
@@ -295,13 +352,14 @@ mod tests {
                 shared: Arc::new(Shared {
                     sinks: Mutex::new(Vec::new()),
                     done: Mutex::new(false),
+                    done_cv: Condvar::new(),
                     err: Mutex::new(None),
                     next_id: Mutex::new(0),
                 }),
             }
         }
         fn add_sink(&self) -> BroadcastSink {
-            let (tx, rx) = mpsc::channel::<Vec<u8>>();
+            let (tx, rx) = mpsc::sync_channel::<Vec<u8>>(SINK_CHANNEL_CAP);
             let closed = Arc::new(Mutex::new(false));
             let id = {
                 let mut n = self.shared.next_id.lock().unwrap();
@@ -312,11 +370,12 @@ mod tests {
             self.shared.sinks.lock().unwrap().push(SinkHandle {
                 id,
                 tx,
-                closed,
+                closed: closed.clone(),
             });
             BroadcastSink {
                 rx,
                 leftover: Vec::new(),
+                closed,
             }
         }
         fn run(&self) {
@@ -325,18 +384,12 @@ mod tests {
             loop {
                 let n = { self.src.lock().unwrap().read(&mut buf).unwrap() };
                 if n > 0 {
-                    let ids: Vec<u64> = shared.sinks.lock().unwrap().iter().map(|s| s.id).collect();
+                    let snapshot: Vec<SinkHandle> =
+                        shared.sinks.lock().unwrap().clone();
                     let chunk = &buf[..n];
-                    for id in ids {
-                        let err = {
-                            let sinks = shared.sinks.lock().unwrap();
-                            match sinks.iter().find(|s| s.id == id) {
-                                Some(s) => s.write(chunk).is_err(),
-                                None => false,
-                            }
-                        };
-                        if err {
-                            BroadcastCapture::remove_sink_id(&shared, id);
+                    for s in snapshot {
+                        if s.write(chunk).is_err() {
+                            BroadcastCapture::remove_sink_id(&shared, s.id);
                         }
                     }
                 }
@@ -350,6 +403,7 @@ mod tests {
             }
             sinks.clear();
             *shared.done.lock().unwrap() = true;
+            shared.done_cv.notify_all();
         }
     }
 

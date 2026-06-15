@@ -1,5 +1,5 @@
-//! AirPlay screen-mirroring video pipeline — a faithful Rust port of
-//! doubletake's internal/airplay/mirror.go (video path; audio is stubbed).
+//! AirPlay screen-mirroring pipeline — a faithful Rust port of doubletake's
+//! internal/airplay/mirror.go (video + audio paths).
 //!
 //! This drives an already-established `rtsp::Session` (paired + HAP-encrypted +
 //! FairPlay key derived) through the mirror SETUP/RECORD handshake, opens the
@@ -24,13 +24,13 @@
 //!   * Frame header (128 bytes, little-endian): see `mirror_header`.
 //!   * NTP frame timestamps: boot-relative, no epoch, with a forward bias.
 //!
-//! Audio is intentionally not streamed (video-only mirror). We still send the
-//! audio SETUP because current Apple receivers require the audio session to
-//! exist before they accept the video stream and RECORD (mirror.go comment).
+//! Audio IS streamed (RTP / ALAC). The audio SETUP is sent first because
+//! current Apple receivers require the audio session to exist before they accept
+//! the video stream and RECORD (mirror.go comment).
 
 #![allow(dead_code)]
 
-use std::io::Write;
+use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -613,6 +613,10 @@ fn put_f32_le(dst: &mut [u8], v: f32) {
 struct DataChannel {
     conn: TcpStream,
     cipher: VideoCipher,
+    /// Per-session forward NTP bias for frame timestamps (mirror.go
+    /// session.timestampBias = sessionLatency). Falls back to
+    /// videoTimestampBias() when <= 0 (mirror.go MirrorSession.ntpTimeNow).
+    timestamp_bias: Duration,
     frame_seq: u32,
     // Presentation (display) size advertised in the codec header (offsets 56/60).
     display_w: i32,
@@ -623,6 +627,18 @@ struct DataChannel {
 }
 
 impl DataChannel {
+    /// ntpTimeNow — per-session NTP frame timestamp using the session
+    /// timestampBias, falling back to videoTimestampBias() when unset
+    /// (mirror.go MirrorSession.ntpTimeNow).
+    fn ntp_time_now(&self) -> u64 {
+        let bias = if self.timestamp_bias > Duration::ZERO {
+            self.timestamp_bias
+        } else {
+            video_timestamp_bias()
+        };
+        ntp_time_with_bias(bias)
+    }
+
     /// sendCodecFrame — unencrypted SPS+PPS avcC packet (header type 0x01).
     fn send_codec_frame(&mut self, payload: &[u8], ntp: u64) -> Result<()> {
         self.frame_seq += 1;
@@ -798,43 +814,67 @@ pub fn run_mirror_with_stop(
     // transport behind an Arc<Mutex> so the keepalive threads can share it.
     let ekey = session.ekey.clone();
     let pair_shared_secret = session.pair_keys.shared_secret.clone();
+    // Whether the control channel is HAP-encrypted (pair-verify happened). This
+    // drives selectAudioSecurityMode + the ChaCha video-cipher gate (mirror.go
+    // c.encrypted), NOT shared-secret emptiness.
+    let encrypted = session.transport.is_encrypted();
+    // Receiver playout-latency floor (mirror.go ReceiverInfo.playoutLatencyFloor):
+    // 0 for FairPlay-SAP receivers (feature bit 1<<14), else conservative 500ms.
+    // Computed inline from the features bit to avoid coupling to info.rs.
+    let supports_fairplay_sap = session.info.features & (1 << 14) != 0;
+    let playout_latency_floor = if supports_fairplay_sap {
+        Duration::ZERO
+    } else {
+        latency::CONSERVATIVE_PLAYOUT_LATENCY
+    };
     let control = Arc::new(Mutex::new(session.transport));
 
-    // ---- NTP timing responder: bind a UDP socket and answer probes ----
-    let timing_sock = std::net::UdpSocket::bind("0.0.0.0:0").context("bind timing UDP")?;
+    // ---- Allocate 3 consecutive UDP ports: timing(N), control(N+1), data(N+2).
+    // Real Apple senders use consecutive ports; the Apple TV classifies incoming
+    // audio by source port and expects this pattern (mirror.go:113-124
+    // allocateConsecutiveUDPPortsInRange). The control + data sockets feed the
+    // audio stream; the declared controlPort in the SETUP descriptor is N+1, the
+    // socket we actually send sync packets from. ----
+    let audio_ports = allocate_consecutive_udp(3).context("allocate audio ports")?;
+    let mut ports_iter = audio_ports.into_iter();
+    let timing_sock = ports_iter.next().unwrap();
+    let audio_ctrl_conn = Some(ports_iter.next().unwrap());
+    let audio_data_conn = Some(ports_iter.next().unwrap());
     let timing_port = timing_sock.local_addr()?.port();
+
+    // Start NTP timing responder BEFORE sending SETUP so it's ready when the
+    // Apple TV probes us (mirror.go:126-128).
     {
         let stop = stop.clone();
         std::thread::spawn(move || ntp_timing_responder(timing_sock, stop));
     }
 
-    // ---- Audio sockets: real senders allocate 3 consecutive UDP ports —
-    // timing(N), control(N+1), data(N+2) — and the receiver classifies incoming
-    // audio by source port. We bind the control + data sockets here so the
-    // declared controlPort in the SETUP descriptor matches the socket we will
-    // actually send sync packets from (audio.go setupMirrorSession). ----
-    let (audio_ctrl_conn, audio_data_conn) = if opts.no_audio {
-        (None, None)
-    } else {
-        match bind_audio_sockets() {
-            Ok((c, d)) => (Some(c), Some(d)),
-            Err(e) => {
-                eprintln!("[audio] could not bind audio UDP sockets: {e}; continuing without audio");
-                (None, None)
-            }
-        }
-    };
+    // ---- Event (reverse) channel: open a TCP listener, avoiding the audio UDP
+    // triple [timingPort, timingPort+2], accept the receiver's event connection,
+    // and keep it open for the session lifetime, draining reads
+    // (mirror.go:130-161). Go does NOT carry the sender's event port in the
+    // SETUP plist; it reserves the listener and separately dials the receiver's
+    // own eventPort read back from the SETUP response. ----
+    let event_listener = listen_tcp_avoiding(timing_port).context("listen event port")?;
+    let event_port = event_listener.local_addr()?.port();
+    eprintln!("[mirror] event listener on TCP port {event_port}");
+    {
+        let stop = stop.clone();
+        std::thread::spawn(move || event_accept_loop(event_listener, stop));
+    }
+
     let audio_control_lport = audio_ctrl_conn
         .as_ref()
         .and_then(|c| c.local_addr().ok())
         .map(|a| a.port())
         .unwrap_or(0);
 
-    // ---- Audio security mode (mirror.go selectAudioSecurityMode + key gen):
-    // an encrypted (HAP / shared-secret) session uses ChaCha20-Poly1305 with a
+    // ---- Audio security mode (mirror.go selectAudioSecurityMode(c.encrypted)):
+    // an encrypted (HAP pair-verified) session uses ChaCha20-Poly1305 with a
     // fresh random 32-byte direct stream key published via `shk`; otherwise the
-    // legacy AES-128-CBC path with the FairPlay key/IV. ----
-    let audio_mode = if !pair_shared_secret.is_empty() {
+    // legacy AES-128-CBC path with the FairPlay key/IV. Keyed on whether the
+    // control channel is encrypted, matching Go's c.encrypted. ----
+    let audio_mode = if encrypted {
         AudioSecurityMode::ChaCha
     } else {
         AudioSecurityMode::LegacyAes
@@ -846,8 +886,11 @@ pub fn run_mirror_with_stop(
     } else {
         None
     };
-    // Legacy AES path reuses the FairPlay stream key/IV (mirror.go: audioKey =
-    // c.fpKey, audioIV = c.fpIV). We map those onto stream_key/iv here.
+    // Legacy AES path reuses the FairPlay key/IV (mirror.go: audioKey = c.fpKey,
+    // audioIV = c.fpIV), which in this port are session.stream_key / session.iv
+    // (the hashed fpKey + random fpIV). Audio encryption is DISABLED when those
+    // are absent (mirror.go: `c.fpKey != nil && c.fpIV != nil`); they are always
+    // present here after FairPlay SAP, so the legacy AES path is enabled.
     let audio_aes_key: Option<[u8; 16]> = if audio_mode == AudioSecurityMode::LegacyAes {
         Some(enc_key)
     } else {
@@ -871,10 +914,15 @@ pub fn run_mirror_with_stop(
     } else {
         0
     };
-    // sessionLatency = TargetLatency() in 44.1 kHz samples (mirror.go
-    // samplesFor44k1(sessionLatency)). Centralized in latency.rs; with the
-    // default 1ms target this is round(44.1) = 44 samples.
-    let audio_latency_samples = latency::target_latency_samples_44k1();
+    // sessionLatency = max(TargetLatency(), playoutLatencyFloor()); audio and
+    // video share it so they stay in sync (mirror.go:163-171,218-220). The
+    // RECORD response may later override it (mirror.go:496-508). Audio latency in
+    // 44.1 kHz samples = samplesFor44k1(sessionLatency).
+    let mut session_latency = latency::target_latency();
+    if session_latency < playout_latency_floor {
+        session_latency = playout_latency_floor;
+    }
+    let mut audio_latency_samples = latency::samples_for_44k1(session_latency);
 
     let mut audio_stream_desc = plist::Dictionary::new();
     audio_stream_desc.insert("type".into(), Value::Integer(96i64.into()));
@@ -945,10 +993,15 @@ pub fn run_mirror_with_stop(
                 .insert("streamConnections".into(), Value::Dictionary(connections));
         }
         _ => {
-            // FairPlay ekey/eiv (legacy AES path on the receiver). et=32.
-            audio_setup.insert("et".into(), Value::Integer(32i64.into()));
-            audio_setup.insert("ekey".into(), Value::Data(ekey.clone()));
-            audio_setup.insert("eiv".into(), Value::Data(enc_iv.to_vec()));
+            // FairPlay ekey/eiv (legacy AES path on the receiver). et=32. Only
+            // added when both FpEkey and fpIV are present (mirror.go:274-281:
+            // `c.FpEkey != nil && c.fpIV != nil`). fpIV (= enc_iv) is always
+            // present here, so the guard reduces to a non-empty ekey.
+            if !ekey.is_empty() {
+                audio_setup.insert("et".into(), Value::Integer(32i64.into()));
+                audio_setup.insert("ekey".into(), Value::Data(ekey.clone()));
+                audio_setup.insert("eiv".into(), Value::Data(enc_iv.to_vec()));
+            }
         }
     }
 
@@ -981,6 +1034,17 @@ pub fn run_mirror_with_stop(
             "[audio] stream: dataPort={audio_data_port} controlPort={audio_control_port}"
         );
     }
+
+    // The receiver advertises its own event port in the SETUP response; the
+    // sender dials back to it (mirror.go:336-346).
+    let mut receiver_event_port: u16 = audio_resp_plist
+        .as_ref()
+        .and_then(|p| p.as_dictionary())
+        .and_then(|d| d.get("eventPort"))
+        .and_then(plist_int)
+        .filter(|p| *p > 0)
+        .map(|p| p as u16)
+        .unwrap_or(0);
 
     // ---- Phase 2: video SETUP ----
     let video_stream_connection_id: i64 =
@@ -1044,6 +1108,42 @@ pub fn run_mirror_with_stop(
     let video_resp_plist =
         parse_plist(&video_resp.body).context("unmarshal video setup response")?;
 
+    // Fall back to the video SETUP response's eventPort when the audio response
+    // did not carry one (mirror.go:426-437).
+    if receiver_event_port == 0 {
+        if let Some(p) = video_resp_plist
+            .as_dictionary()
+            .and_then(|d| d.get("eventPort"))
+            .and_then(plist_int)
+            .filter(|p| *p > 0)
+        {
+            receiver_event_port = p as u16;
+        }
+    }
+
+    // Connect to the receiver's event port if it advertised one (mirror.go:439-448).
+    // The connection is kept open for the session lifetime as the outbound event
+    // channel; we hold it so it is not dropped/closed early.
+    let _receiver_event_conn: Option<TcpStream> = if receiver_event_port > 0 {
+        use std::net::ToSocketAddrs;
+        let event_addr = format!("{host}:{receiver_event_port}");
+        match event_addr.to_socket_addrs().ok().and_then(|mut a| a.next()) {
+            Some(sa) => match TcpStream::connect_timeout(&sa, Duration::from_secs(3)) {
+                Ok(c) => {
+                    eprintln!("[event] connected to receiver event port {event_addr}");
+                    Some(c)
+                }
+                Err(e) => {
+                    eprintln!("[event] connect to receiver event port {event_addr} failed: {e}");
+                    None
+                }
+            },
+            None => None,
+        }
+    } else {
+        None
+    };
+
     // Extract the video data port (type=110 stream's dataPort).
     let data_port = extract_video_data_port(&video_resp_plist)
         .ok_or_else(|| anyhow!("no video data port in SETUP response"))?;
@@ -1066,8 +1166,8 @@ pub fn run_mirror_with_stop(
     conn.set_nodelay(true).ok();
     eprintln!("[mirror] data channel connected: {data_addr}");
 
-    // ---- RECORD ----
-    control
+    // ---- RECORD to start the session ----
+    let record_resp = control
         .lock()
         .unwrap()
         .request(
@@ -1083,36 +1183,77 @@ pub fn run_mirror_with_stop(
         )
         .context("RECORD")?;
 
-    // ---- SET_PARAMETER volume, sent twice like real senders. 0 dB is max,
-    // -144 dB mutes (mirror.go SetAudioMuted). --mute selects the muted level. --
-    let volume_body: &[u8] = if opts.mute_audio {
-        b"volume: -144.000000\r\n"
-    } else {
-        b"volume: 0.000000\r\n"
-    };
-    let _ = control.lock().unwrap().request(
-        "SET_PARAMETER",
-        &audio_uri,
-        "text/parameters",
-        volume_body,
-        &[],
-    );
-    let _ = control.lock().unwrap().request(
-        "SET_PARAMETER",
-        &audio_uri,
-        "text/parameters",
-        volume_body,
-        &[],
-    );
+    // The receiver may report its authoritative playout latency via the
+    // Audio-Latency response header. When present and > 0, drive both audio and
+    // video from it so they stay in sync, overriding our fallback floor
+    // (mirror.go:496-508). headers are lowercased by the transport.
+    if let Some(value) = record_resp.headers.get("audio-latency") {
+        match value.trim().parse::<u32>() {
+            Ok(parsed) if parsed > 0 => {
+                audio_latency_samples = parsed;
+                session_latency = Duration::from_nanos(
+                    (parsed as u64) * 1_000_000_000 / 44_100,
+                );
+                eprintln!(
+                    "[mirror] receiver audio latency: {parsed} samples ({:?}); using for audio+video",
+                    session_latency
+                );
+            }
+            _ => {}
+        }
+    }
 
-    // ---- Select the video cipher (mirror.go setupMirrorSession) ----
-    // Our Session is always HAP-encrypted with a pair-verify shared secret, so
-    // the ChaCha20-Poly1305 path is what real Apple TVs use. Fall back to AES-CTR
-    // when no shared secret is present (UxPlay / plaintext).
+    // The per-session video frame NTP timestamps use this session latency as
+    // their forward bias (mirror.go: session.timestampBias = sessionLatency).
+    let timestamp_bias = session_latency;
+
+    // ---- SET_PARAMETER volume, sent twice like real senders. The initial
+    // volume is always 0.000000 (max); muting is a separate runtime call
+    // (mirror.go:510-519 SetAudioMuted). --mute is applied as a post-setup
+    // SET_PARAMETER below, after the two initial 0.000000 sends. ----
+    let volume_body: &[u8] = b"volume: 0.000000\r\n";
+    let _ = control.lock().unwrap().request(
+        "SET_PARAMETER",
+        &audio_uri,
+        "text/parameters",
+        volume_body,
+        &[],
+    );
+    let _ = control.lock().unwrap().request(
+        "SET_PARAMETER",
+        &audio_uri,
+        "text/parameters",
+        volume_body,
+        &[],
+    );
+    // --mute: separate post-setup SET_PARAMETER mirroring SetAudioMuted(true)
+    // (volume -144 dB = muted). The two initial sends above stay 0.000000.
+    if opts.mute_audio {
+        let _ = control.lock().unwrap().request(
+            "SET_PARAMETER",
+            &audio_uri,
+            "text/parameters",
+            b"volume: -144.000000\r\n",
+            &[],
+        );
+    }
+
+    // ---- Select the video cipher (mirror.go:544-598 setupMirrorSession) ----
+    // Take the ChaCha20-Poly1305 path when the control channel is encrypted and
+    // either a pair-verify shared secret OR the raw FairPlay AES key is present;
+    // IKM = shared secret if present, else fpAesKey (mirror.go:547-558).
+    //
+    // In this port `enc_key` (= Go c.fpKey) is always present after FairPlay SAP,
+    // and HAP encryption is always derived from the pair-verify shared secret, so
+    // `encrypted` implies a non-empty shared secret. The fpAesKey-only IKM
+    // fallback is therefore not reachable here (it would require encrypted ==
+    // true with an empty shared secret, which the HAP path never produces); the
+    // raw fpAesKey is not threaded onto Session. Otherwise (UxPlay / plaintext,
+    // not encrypted) fall back to AES-128-CTR.
     let cipher = if opts.no_encrypt {
         eprintln!("[mirror] video frame encryption DISABLED");
         VideoCipher::None
-    } else if !pair_shared_secret.is_empty() {
+    } else if encrypted && !pair_shared_secret.is_empty() {
         let chacha_key =
             derive_chacha_key(&pair_shared_secret, video_stream_connection_id)?;
         let aead = ChaCha20Poly1305::new_from_slice(&chacha_key)
@@ -1132,6 +1273,7 @@ pub fn run_mirror_with_stop(
     let data = Arc::new(Mutex::new(DataChannel {
         conn,
         cipher,
+        timestamp_bias,
         frame_seq: 0,
         display_w: display_w as i32,
         display_h: display_h as i32,
@@ -1175,10 +1317,9 @@ pub fn run_mirror_with_stop(
         control.clone(),
         audio_uri.clone(),
         session_uuid.clone(),
-        first_frame.clone(),
         stop.clone(),
     );
-    spawn_feedback_loop(control.clone(), first_frame.clone(), stop.clone());
+    spawn_feedback_loop(control.clone(), stop.clone());
 
     // Ctrl-C handler: flip the stop flag so the capture loop exits cleanly.
     {
@@ -1275,27 +1416,94 @@ pub fn run_mirror_with_stop(
     result
 }
 
-/// Bind the audio control + data UDP sockets. Real senders use consecutive
-/// ports (control, data=control+1); we try that first and fall back to two
-/// independent ephemeral ports if the consecutive pair is unavailable.
-fn bind_audio_sockets() -> Result<(std::net::UdpSocket, std::net::UdpSocket)> {
+/// allocateConsecutiveUDPPortsInRange (ephemeral path) — allocate `count`
+/// consecutive UDP ports: timing(N), control(N+1), data(N+2). The OS picks the
+/// base port; subsequent ports are base+1, base+2, … The Apple TV classifies
+/// incoming audio by source port and expects this consecutive pattern
+/// (mirror.go:1812-1871). Retries up to 20 times, matching Go.
+fn allocate_consecutive_udp(count: usize) -> Result<Vec<std::net::UdpSocket>> {
     use std::net::UdpSocket;
-    // Try to grab a consecutive (N, N+1) pair a few times.
-    for _ in 0..16 {
-        let ctrl = UdpSocket::bind("0.0.0.0:0").context("bind audio control")?;
-        let cport = ctrl.local_addr()?.port();
-        if cport == u16::MAX {
+    for _ in 0..20 {
+        let first = match UdpSocket::bind("0.0.0.0:0") {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+        let base = match first.local_addr() {
+            Ok(a) => a.port(),
+            Err(_) => continue,
+        };
+        if base == 0 || (base as usize) + count - 1 > u16::MAX as usize {
             continue;
         }
-        if let Ok(data) = UdpSocket::bind(("0.0.0.0", cport + 1)) {
-            return Ok((ctrl, data));
+        let mut conns = vec![first];
+        let mut ok = true;
+        for i in 1..count {
+            match UdpSocket::bind(("0.0.0.0", base + i as u16)) {
+                Ok(c) => conns.push(c),
+                Err(_) => {
+                    ok = false;
+                    break;
+                }
+            }
         }
-        // Drop `ctrl` and retry.
+        if ok {
+            return Ok(conns);
+        }
+        // Drop the partial set and retry.
     }
-    // Fall back to two independent ephemeral sockets.
-    let ctrl = UdpSocket::bind("0.0.0.0:0").context("bind audio control")?;
-    let data = UdpSocket::bind("0.0.0.0:0").context("bind audio data")?;
-    Ok((ctrl, data))
+    Err(anyhow!(
+        "could not allocate {count} consecutive UDP ports after 20 attempts"
+    ))
+}
+
+/// listenTCPInRange (ephemeral path) — open a TCP listener for the event
+/// channel. With an OS-assigned ephemeral port there is no range to scan; we
+/// re-bind until the chosen port does not overlap the audio UDP triple
+/// [skip_base, skip_base+2] (mirror.go:1873-1893).
+fn listen_tcp_avoiding(skip_base: u16) -> Result<std::net::TcpListener> {
+    use std::net::TcpListener;
+    for _ in 0..32 {
+        let l = TcpListener::bind("0.0.0.0:0").context("listen event TCP")?;
+        let p = l.local_addr()?.port();
+        if skip_base > 0 && p >= skip_base && p <= skip_base.saturating_add(2) {
+            // Overlaps the audio UDP triple; re-bind to get a different port.
+            continue;
+        }
+        return Ok(l);
+    }
+    Err(anyhow!("no free TCP port for the event channel"))
+}
+
+/// event_accept_loop — accept the receiver's inbound event (reverse) connection,
+/// then keep it open for the session lifetime, draining reads until the peer
+/// closes or `stop` is set (mirror.go:139-161).
+fn event_accept_loop(listener: std::net::TcpListener, stop: Arc<AtomicBool>) {
+    let conn = match listener.accept() {
+        Ok((c, addr)) => {
+            eprintln!("[event] Apple TV connected for reverse events from {addr}");
+            c
+        }
+        Err(_) => return,
+    };
+    // Short read timeout so the drain loop can observe the stop flag.
+    conn.set_read_timeout(Some(Duration::from_secs(1))).ok();
+    let mut buf = [0u8; 4096];
+    loop {
+        if stop.load(Ordering::Relaxed) {
+            return;
+        }
+        match (&conn).read(&mut buf) {
+            Ok(0) => return, // peer closed
+            Ok(_n) => {}
+            Err(ref e)
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut =>
+            {
+                continue;
+            }
+            Err(_) => return,
+        }
+    }
 }
 
 /// extract_audio_ports — find the type=96 stream's data/control ports in a SETUP
@@ -1348,25 +1556,18 @@ fn extract_audio_ports(resp: &plist::Value) -> Option<(u16, u16)> {
 /// heartbeatLoop — periodic GET_PARAMETER on the control URI every 15s, with
 /// the `Session` header. Some receivers (Apple TV) return 400 for
 /// GET_PARAMETER; after 3 consecutive failures we silently stop (the /feedback
-/// POST and data-channel heartbeat provide redundant keepalive). Waits for the
-/// first video frame before starting, and stops when `stop` is set.
+/// POST and data-channel heartbeat provide redundant keepalive). Starts at SETUP
+/// time (mirror.go:634), not gated on the first frame, and stops when `stop` is
+/// set.
 fn spawn_heartbeat_loop(
     control: Arc<Mutex<Transport>>,
     uri: String,
     session_id: String,
-    first_frame: Arc<AtomicBool>,
     stop: Arc<AtomicBool>,
 ) {
     std::thread::spawn(move || {
-        // Gate on the first video frame (mirror.go starts the loops then, and
-        // the loop body waits implicitly; here we wait explicitly).
-        while !first_frame.load(Ordering::Relaxed) {
-            if stop.load(Ordering::Relaxed) {
-                return;
-            }
-            std::thread::sleep(Duration::from_millis(50));
-        }
-
+        // mirror.go:634 starts this loop at SETUP time (immediately), NOT gated
+        // on the first frame. The 15s ticker fires the first request after 15s.
         let mut consecutive_failures = 0u32;
         loop {
             // 15s tick, checking the stop flag every 100ms.
@@ -1407,21 +1608,14 @@ fn spawn_heartbeat_loop(
 }
 
 /// feedbackLoop — POST /feedback every 2s, with an immediate first feedback to
-/// beat UxPlay's ~3s timeout. Waits for the first video frame, then stops when
-/// `stop` is set. Faithful port of mirror.go's feedbackLoop.
+/// beat UxPlay's ~3s timeout. Starts at SETUP time (mirror.go:636), not gated on
+/// the first frame, so the immediate first feedback actually happens early. Stops
+/// when `stop` is set. Faithful port of mirror.go's feedbackLoop.
 fn spawn_feedback_loop(
     control: Arc<Mutex<Transport>>,
-    first_frame: Arc<AtomicBool>,
     stop: Arc<AtomicBool>,
 ) {
     std::thread::spawn(move || {
-        while !first_frame.load(Ordering::Relaxed) {
-            if stop.load(Ordering::Relaxed) {
-                return;
-            }
-            std::thread::sleep(Duration::from_millis(50));
-        }
-
         // Immediate first feedback (mirror.go sends one before the ticker).
         {
             let mut t = control.lock().unwrap();
@@ -1486,7 +1680,8 @@ fn stream_frames(
                     return Ok(());
                 }
 
-                let ntp = ntp_time_with_bias(video_timestamp_bias());
+                // Per-session NTP bias (mirror.go: packetTimestamp = s.ntpTimeNow()).
+                let ntp = data.lock().unwrap().ntp_time_now();
 
                 if pending_keyframe && !codec_sent {
                     if let (Some(sps), Some(pps)) = (&latest_sps, &latest_pps) {

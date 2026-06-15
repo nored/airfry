@@ -293,7 +293,17 @@ impl Transport {
             .context("read frame length")?;
         let plaintext_len = u16::from_le_bytes(len_buf) as usize;
         if plaintext_len == 0 || plaintext_len > 16384 {
-            bail!("suspicious HAP frame length {plaintext_len}");
+            // Match client.go:526-533: on a suspicious length, peek up to 32 more
+            // bytes off the socket (the raw wire may not be encrypted frames)
+            // before erroring, so socket consumption matches Go on the error path.
+            // Go uses a single non-blocking-ish Read (not ReadFull), which yields
+            // however many bytes are currently available, up to 32.
+            let mut peek = [0u8; 32];
+            let n = self.conn.read(&mut peek).unwrap_or(0);
+            bail!(
+                "suspicious frame length {plaintext_len} (expected 1-1024); next {n} bytes on wire: {}",
+                hex_encode(&peek[..n])
+            );
         }
         let mut ciphertext = vec![0u8; plaintext_len + 16];
         self.conn
@@ -324,7 +334,11 @@ fn finish_response(
     body: Vec<u8>,
 ) -> Result<Response> {
     if !(200..300).contains(&status) {
-        bail!("RTSP status {status} (body {} bytes)", body.len());
+        // Mirror Go's HTTPStatusError, which carries the response body and
+        // formats as "HTTP %d (body: %s)" (client.go:78-80). The body bytes have
+        // already been drained off the socket by the caller, so socket
+        // consumption is unchanged — only the error text now includes the body.
+        bail!("HTTP {status} (body: {})", String::from_utf8_lossy(&body));
     }
     Ok(Response {
         status,
@@ -365,6 +379,16 @@ fn parse_http_header(header: &[u8]) -> (u16, usize, HashMap<String, String>) {
         }
     }
     (status, content_length, headers)
+}
+
+/// Lowercase hex encoding (matches Go's encoding/hex.EncodeToString), used only
+/// for the suspicious-frame-length diagnostic in the error path.
+fn hex_encode(bytes: &[u8]) -> String {
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        s.push_str(&format!("{b:02x}"));
+    }
+    s
 }
 
 fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {

@@ -632,20 +632,24 @@ pub fn raw_pair_verify(
         ctr.apply_keystream(&mut server_sig);
     }
 
-    // Verify server's signature over (server_X25519 || client_X25519) when we
-    // have the receiver's ed25519 PK; otherwise skip (PK unavailable).
+    // Verify server's Ed25519 signature over (server_X25519 || client_X25519).
+    // pairing.go:647-653 ABORTS when the receiver's PK is missing/short and
+    // always verifies the signature — there is no "skip" path. We mirror that:
+    // an unavailable PK, an unparseable PK, or a failed verification all error.
     let mut server_sig_msg = [0u8; 64];
     server_sig_msg[..32].copy_from_slice(&server_public_bytes);
     server_sig_msg[32..].copy_from_slice(&client_pub_bytes);
-    if server_ed25519_pk.len() >= 32 {
-        let mut pk = [0u8; 32];
-        pk.copy_from_slice(&server_ed25519_pk[..32]);
-        if let Ok(vk) = VerifyingKey::from_bytes(&pk) {
-            let sig = ed25519_dalek::Signature::from_bytes(&server_sig);
-            if vk.verify(&server_sig_msg, &sig).is_err() {
-                bail!("server signature verification failed");
-            }
-        }
+    if server_ed25519_pk.len() < 32 {
+        // Matches Go: "server Ed25519 public key not available (call GetInfo first)".
+        bail!("server Ed25519 public key not available (call GetInfo first)");
+    }
+    let mut pk = [0u8; 32];
+    pk.copy_from_slice(&server_ed25519_pk[..32]);
+    let vk = VerifyingKey::from_bytes(&pk)
+        .map_err(|_| anyhow!("server signature verification failed"))?;
+    let sig = ed25519_dalek::Signature::from_bytes(&server_sig);
+    if vk.verify(&server_sig_msg, &sig).is_err() {
+        bail!("server signature verification failed");
     }
 
     // Sign our proof: Ed25519_sign(client_X25519 || server_X25519).

@@ -500,14 +500,23 @@ impl AudioCapture {
 
     /// DrainStale — discard whatever PCM backlog accumulated between capture
     /// start and the first read, so streaming begins from the freshest sample
-    /// (audio.go DrainStale). Drops any buffered (already-delivered) PCM plus a
-    /// short non-blocking sweep of the channel.
+    /// (audio.go DrainStale). Go loop-drains the full kernel/pipe backlog with a
+    /// re-armed 2ms idle deadline: while a backlog exists, reads return buffered
+    /// data immediately; once the source is empty the read blocks and the 2ms
+    /// deadline fires before the next live frame (~8ms) arrives, ending the
+    /// drain. We mirror that with `recv_timeout(2ms)` over the capture channel
+    /// (plus any already-buffered PCM), draining until idle rather than only the
+    /// instantaneously-queued frames.
     pub fn drain_stale(&mut self) {
         let mut discarded = self.pcm.len();
         self.pcm.clear();
-        // Drain anything already queued without blocking on fresh frames.
-        while let Ok(chunk) = self.rx.try_recv() {
-            discarded += chunk.len();
+        // Re-arm a 2ms idle deadline each read: drains the whole backlog and
+        // stops once no new frame arrives within the poll window.
+        loop {
+            match self.rx.recv_timeout(Duration::from_millis(2)) {
+                Ok(chunk) => discarded += chunk.len(),
+                Err(_) => break, // timeout (idle) or disconnected
+            }
         }
         if discarded > 0 {
             let bytes_per_second = (AUDIO_SAMPLE_RATE * 2 * 2) as f64; // 44.1k, stereo, S16LE

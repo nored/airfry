@@ -163,23 +163,53 @@ impl CredentialStore {
     }
 
     /// persist writes the whole map back to disk as pretty JSON, creating the
-    /// parent dir with 0700 and the file with 0600 (port of fileBackend.persist).
+    /// parent dir with 0700 and the file with 0600 (port of fileBackend.persist:
+    /// os.MkdirAll(dir, 0700) + os.WriteFile(path, data, 0600)).
+    ///
+    /// The permission bits are applied AT CREATION (DirBuilder.mode / OpenOptions
+    /// .mode) rather than created-then-chmod, so the file is never momentarily
+    /// world-readable, and the security-sensitive write surfaces any error
+    /// instead of silently ignoring it.
     fn persist(&self) -> Result<()> {
         if let Some(dir) = self.path.parent() {
-            std::fs::create_dir_all(dir).context("create credential dir")?;
+            // os.MkdirAll(dir, 0700): create the dir tree, applying 0700 to any
+            // directories created. (On non-unix, mode() is a no-op.)
+            let mut builder = std::fs::DirBuilder::new();
+            builder.recursive(true);
             #[cfg(unix)]
             {
-                use std::os::unix::fs::PermissionsExt;
-                let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
+                use std::os::unix::fs::DirBuilderExt;
+                builder.mode(0o700);
             }
+            builder.create(dir).context("create credential dir")?;
         }
+
         let data = serde_json::to_vec_pretty(&self.devices).context("marshal credential store")?;
-        std::fs::write(&self.path, &data).context("write credential store")?;
+
+        // os.WriteFile(path, data, 0600): truncate-or-create with 0600. The mode
+        // only takes effect when the file is newly created; an existing file
+        // keeps its mode, matching Go's os.WriteFile semantics.
         #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(&self.path, std::fs::Permissions::from_mode(0o600));
-        }
+        let mut f = {
+            use std::os::unix::fs::OpenOptionsExt;
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .mode(0o600)
+                .open(&self.path)
+                .context("write credential store")?
+        };
+        #[cfg(not(unix))]
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&self.path)
+            .context("write credential store")?;
+
+        use std::io::Write as _;
+        f.write_all(&data).context("write credential store")?;
         Ok(())
     }
 }
