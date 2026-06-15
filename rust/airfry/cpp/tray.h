@@ -31,6 +31,11 @@ void airfry_tray_set_devices(const char* const* names,
 /* Set the status/section header line. Thread-safe (marshals onto GUI thread). */
 void airfry_tray_set_status(const char* text);
 
+/* Show a modal PIN-entry dialog (on the GUI thread) and copy the entered code
+ * into `buf` (NUL-terminated). Safe to call from a worker thread: it blocks
+ * until the user responds. Returns the code length, or -1 if cancelled/empty. */
+int airfry_tray_ask_pin(char* buf, int buflen);
+
 #ifdef __cplusplus
 }
 #endif

@@ -14,6 +14,8 @@
 #include <QHBoxLayout>
 #include <QLabel>
 #include <QSlider>
+#include <QInputDialog>
+#include <QLineEdit>
 #include <QAction>
 #include <QIcon>
 #include <QPixmap>
@@ -25,6 +27,7 @@
 
 #include <vector>
 #include <string>
+#include <cstring>
 
 // ---------------------------------------------------------------------------
 // Controller QObject — owns the menu and reacts to Qt signals, forwarding into
@@ -43,6 +46,10 @@ public:
     // QueuedConnection from worker threads.
     Q_INVOKABLE void applyDevices(QVector<QString> names, QVector<QString> addrs);
     Q_INVOKABLE void applyStatus(QString text);
+    // Show a modal PIN-entry dialog on the GUI thread and return the code
+    // (empty if cancelled). Called via BlockingQueuedConnection from the
+    // pairing worker thread when the receiver requires a code.
+    Q_INVOKABLE QString askPin();
 
 private slots:
     void onAboutToShow();
@@ -179,6 +186,17 @@ void TrayController::applyStatus(QString text) {
     if (m_status) m_status->setText(text);
 }
 
+QString TrayController::askPin() {
+    bool ok = false;
+    QString code = QInputDialog::getText(
+        nullptr,
+        QStringLiteral("AirFry — pairing code"),
+        QStringLiteral("Enter the code shown on the Apple TV:"),
+        QLineEdit::Normal, QString(), &ok);
+    if (!ok) return QString();
+    return code.trimmed();
+}
+
 void TrayController::applyDevices(QVector<QString> names, QVector<QString> addrs) {
     // Remove old device actions.
     for (QAction* a : m_deviceActions) {
@@ -251,6 +269,24 @@ extern "C" void airfry_tray_set_status(const char* text) {
     QString t = QString::fromUtf8(text ? text : "");
     QMetaObject::invokeMethod(g_ctrl, "applyStatus", Qt::QueuedConnection,
                               Q_ARG(QString, t));
+}
+
+// Called from the pairing worker thread. Runs a modal PIN dialog on the GUI
+// thread (BlockingQueuedConnection blocks this worker until the user responds)
+// and copies the entered code into `buf`. Returns the code length, or -1 if
+// cancelled / empty / unavailable.
+extern "C" int airfry_tray_ask_pin(char* buf, int buflen) {
+    if (!g_ctrl || !buf || buflen <= 0) return -1;
+    QString result;
+    QMetaObject::invokeMethod(g_ctrl, "askPin", Qt::BlockingQueuedConnection,
+                              Q_RETURN_ARG(QString, result));
+    if (result.isEmpty()) return -1;
+    QByteArray utf8 = result.toUtf8();
+    int n = utf8.size();
+    if (n >= buflen) n = buflen - 1;
+    memcpy(buf, utf8.constData(), n);
+    buf[n] = '\0';
+    return n;
 }
 
 #include "tray.moc"

@@ -39,6 +39,7 @@ extern "C" {
         n: c_int,
     );
     fn airfry_tray_set_status(text: *const c_char);
+    fn airfry_tray_ask_pin(buf: *mut c_char, buflen: c_int) -> c_int;
 }
 
 // ---------------------------------------------------------------------------
@@ -118,6 +119,25 @@ fn save_underscan(pct: u8) {
 fn set_status(text: &str) {
     if let Ok(c) = CString::new(text) {
         unsafe { airfry_tray_set_status(c.as_ptr()) };
+    }
+}
+
+/// Show the modal Qt PIN dialog (blocks this worker thread until the user
+/// responds) and return the entered code. `None` if cancelled/empty.
+fn ask_pin_dialog() -> Option<String> {
+    let mut buf = [0u8; 64];
+    let n = unsafe { airfry_tray_ask_pin(buf.as_mut_ptr() as *mut c_char, buf.len() as c_int) };
+    if n <= 0 {
+        return None;
+    }
+    let s = unsafe { std::ffi::CStr::from_ptr(buf.as_ptr() as *const c_char) }
+        .to_string_lossy()
+        .trim()
+        .to_string();
+    if s.is_empty() {
+        None
+    } else {
+        Some(s)
     }
 }
 
@@ -234,9 +254,12 @@ fn start_mirror(addr: &str) {
         opts.fit_pct = pct;
 
         let mut report = |_phase: &str, _ok: bool, _detail: &str| {};
-        // TODO: prompt for the PIN via a Qt dialog when the receiver requires a
-        // code. For now the tray attempts PIN-less pairing only.
-        let mut ask_pin = || None;
+        // When the receiver requires a code, pop a modal Qt PIN dialog (runs on
+        // the GUI thread; this worker thread blocks until the user responds).
+        let mut ask_pin = || {
+            set_status("Enter the code shown on the Apple TV…");
+            ask_pin_dialog()
+        };
         let session =
             match rtsp::Session::connect_host_with(
                 &host,
