@@ -439,12 +439,8 @@ impl Session {
         // /info is parsed. Decoded from hex; ignored if malformed.
         let mds_pk = decode_hex(&device.pk);
         // Key the credential store by the receiver's stable device id when known,
-        // falling back to its IP otherwise.
-        let device_key = if device.device_id.is_empty() {
-            device.ip.clone()
-        } else {
-            device.device_id.clone()
-        };
+        // falling back to its IP otherwise (main.go:139 keys on info.DeviceID).
+        let device_key = credential_key(&device.device_id, &device.ip);
         Self::connect_host_full(
             &device.ip,
             device.port,
@@ -541,72 +537,140 @@ impl Session {
         }
 
         // ---- Pairing decision tree (doubletake cmd/doubletake/main.go:126-228).
-        // An explicit PIN does a full PIN pairing directly. With no PIN we try
-        // the transient (raw->TLV8) flow; if the receiver rejects it (e.g. it
-        // requires a code), we ask it to DISPLAY its PIN, prompt the caller for
-        // the code, RECONNECT on a fresh socket, and do a PIN pairing — exactly
-        // doubletake's promptForPIN + reconnect fallback.
+        // Three top-level branches, exactly mirroring main.go:
+        //   1. Explicit PIN (needFullPair): full PIN pair-setup, then persist
+        //      (main.go:142-161).
+        //   2. Saved credentials present: pair-verify ONLY with the saved
+        //      ed25519 identity — the cheap reconnect that skips SRP
+        //      (main.go:162-203). On failure, cascade to transient -> PIN with
+        //      fresh reconnects between attempts.
+        //   3. No PIN, no saved creds: transient pairing, falling back to a
+        //      PIN prompt + fresh-reconnect PIN pairing (main.go:204-228).
         let pair_keys: PairKeys;
 
         if !pin.is_empty() {
-            // Explicit PIN: full PIN pairing, then persist the identity.
+            // (1) Explicit PIN: full PIN pairing, then persist the identity
+            // (main.go:142-161).
             let keys = do_pairing(&mut transport, &mut info, pin, &pairing_id, reuse_seed, progress)?;
             let _ = cred_store
                 .save(device_id, &pairing_id, &keys.ed25519_public, &keys.ed25519_seed)
                 .map(|_| progress("credentials", true, "saved pairing identity"));
             pair_keys = keys;
-        } else {
-            match do_pairing(&mut transport, &mut info, "", &pairing_id, reuse_seed, progress) {
-                Ok(keys) => pair_keys = keys,
+        } else if let Some((saved_pub, saved_seed)) = saved.as_ref().and_then(|c| {
+            if c.has_pairing_credentials() {
+                c.ed25519_keys()
+            } else {
+                None
+            }
+        }) {
+            // (2) Saved-credentials FAST PATH (main.go:162-203): build PairKeys
+            // from the saved ed25519 identity and run pair-verify ONLY — no
+            // pair-setup / SRP. pair_verify does a fresh X25519 exchange and
+            // signs with the saved ed25519 key, so it runs standalone here.
+            progress("credentials", true, "using saved credentials; pair-verify only");
+            let mut keys = PairKeys {
+                ed25519_public: saved_pub,
+                ed25519_seed: saved_seed.to_vec(),
+                ..Default::default()
+            };
+            match pairing::pair_verify(&mut transport, &pairing_id, &mut keys) {
+                Ok(()) => {
+                    progress("pair-verify", true, "saved-creds pair-verify (control channel encrypted)");
+                    pair_keys = keys;
+                }
                 Err(e) => {
+                    // pair-verify with saved creds failed -> fall back to
+                    // transient, then PIN, each on a FRESH socket (main.go:171-203).
                     progress(
-                        "pair-setup",
+                        "pair-verify",
                         false,
-                        &format!("transient failed ({e}); receiver requires a pairing code"),
+                        &format!("saved-creds pair-verify failed ({e}); falling back to transient pairing"),
                     );
-                    // Ask the receiver to show its PIN (best effort on this conn).
-                    let _ = pairing::pair_pin_start(&mut transport);
-                    // Prompt the caller (stdin / tray dialog) for the displayed code.
-                    let code = match pin_provider() {
-                        Some(p) if !p.trim().is_empty() => p.trim().to_string(),
-                        _ => {
-                            return Err(e
-                                .context("receiver requires a pairing code, but none was provided"))
-                        }
-                    };
-                    progress("pin", true, "got pairing code; reconnecting");
-                    // Reconnect on a FRESH socket — the failed attempt dirtied it.
+                    // The failed pair-verify may have dirtied/closed the socket;
+                    // reconnect + GetInfo before the transient attempt (main.go:174-180).
                     drop(transport);
-                    let mut t2 = Transport::connect(host, port)
-                        .context("reconnect for PIN pairing")?;
-                    let mut info2 = info::get_info(&mut t2).unwrap_or_default();
-                    if info2.pk.is_empty() && !mdns_pk.is_empty() {
-                        info2.pk = mdns_pk.to_vec();
+                    let mut t = Transport::connect(host, port)
+                        .context("reconnect after saved-creds pair-verify")?;
+                    let mut i = info::get_info(&mut t).unwrap_or_default();
+                    if i.pk.is_empty() && !mdns_pk.is_empty() {
+                        i.pk = mdns_pk.to_vec();
                     }
-                    let keys =
-                        do_pairing(&mut t2, &mut info2, &code, &pairing_id, reuse_seed, progress)?;
-                    let _ = cred_store
-                        .save(device_id, &pairing_id, &keys.ed25519_public, &keys.ed25519_seed)
-                        .map(|_| progress("credentials", true, "saved pairing identity"));
-                    transport = t2;
-                    info = info2;
+                    let (t, i, keys) = cascade_transient_then_pin(
+                        t,
+                        i,
+                        host,
+                        port,
+                        mdns_pk,
+                        device_id,
+                        &pairing_id,
+                        reuse_seed,
+                        &mut cred_store,
+                        pin_provider,
+                        progress,
+                    )?;
+                    transport = t;
+                    info = i;
                     pair_keys = keys;
                 }
             }
+        } else {
+            // (3) Transient pairing (no saved creds, no PIN), falling back to
+            // a PIN prompt + fresh-reconnect PIN pairing (main.go:204-228).
+            let (t, i, keys) = cascade_transient_then_pin(
+                transport,
+                info,
+                host,
+                port,
+                mdns_pk,
+                device_id,
+                &pairing_id,
+                reuse_seed,
+                &mut cred_store,
+                pin_provider,
+                progress,
+            )?;
+            transport = t;
+            info = i;
+            pair_keys = keys;
         }
 
-        // fp-setup (FairPlay SAP) -> stream key/iv.
-        let fp: FairPlayKeys =
-            match fairplay::fair_play_setup(&mut transport, &pair_keys.shared_secret) {
-                Ok(fp) => {
-                    progress("fp-setup", true, "FairPlay stream key derived");
-                    fp
-                }
-                Err(e) => {
+        // fp-setup (FairPlay SAP) -> stream key/iv. doubletake (main.go:234-243)
+        // treats FairPlay failure as NON-fatal when the receiver does not
+        // advertise FairPlay SAP (client.go ErrFairPlayUnsupported): it logs and
+        // continues with the pair-verify DataStream path, where mirror.rs derives
+        // the ChaCha20 stream key from the pair-verify shared secret instead of a
+        // FairPlay stream key. A failure on a receiver that DOES advertise SAP is
+        // still fatal.
+        let fp: FairPlayKeys = match fairplay::fair_play_setup(&mut transport, &pair_keys.shared_secret) {
+            Ok(fp) => {
+                progress("fp-setup", true, "FairPlay stream key derived");
+                fp
+            }
+            Err(e) => {
+                if info.supports_fairplay_sap() {
                     progress("fp-setup", false, &e.to_string());
                     return Err(e.context("fp-setup"));
                 }
-            };
+                // Soft-fallback: no FairPlay stream key. mirror.rs selects the
+                // ChaCha DataStream path from the pair-verify shared secret when
+                // the control channel is encrypted, so an empty FairPlay key/ekey
+                // is fine. Keep `iv` random for completeness.
+                progress(
+                    "fp-setup",
+                    false,
+                    &format!("FairPlay SAP unsupported ({e}); continuing with pair-verify DataStream"),
+                );
+                let mut iv = [0u8; 16];
+                rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut iv);
+                FairPlayKeys {
+                    stream_key: [0u8; 16],
+                    iv,
+                    ekey: Vec::new(),
+                    aes_key: [0u8; 16],
+                    m3: Vec::new(),
+                }
+            }
+        };
 
         Ok(Session {
             transport,
@@ -618,6 +682,67 @@ impl Session {
             session_id,
             info,
         })
+    }
+}
+
+/// The transient -> PIN cascade shared by the saved-creds-failure path
+/// (main.go:171-203) and the no-credentials path (main.go:204-228).
+///
+/// Takes ownership of a fresh transport (and its `info`), tries the transient
+/// `do_pairing("")`. On failure it asks the receiver to DISPLAY its PIN, prompts
+/// the caller for the code, RECONNECTS on a fresh socket (the failed attempt
+/// dirtied the previous one), and does a PIN `do_pairing(code)`, persisting the
+/// resulting identity. Returns the (possibly reconnected) transport, its info
+/// and the pairing keys so the caller can continue with fp-setup on the live
+/// socket.
+#[allow(clippy::too_many_arguments)]
+fn cascade_transient_then_pin(
+    mut transport: Transport,
+    mut info: ReceiverInfo,
+    host: &str,
+    port: u16,
+    mdns_pk: &[u8],
+    device_id: &str,
+    pairing_id: &str,
+    reuse_seed: Option<[u8; 32]>,
+    cred_store: &mut CredentialStore,
+    pin_provider: &mut dyn FnMut() -> Option<String>,
+    progress: &mut dyn FnMut(&str, bool, &str),
+) -> Result<(Transport, ReceiverInfo, PairKeys)> {
+    match do_pairing(&mut transport, &mut info, "", pairing_id, reuse_seed, progress) {
+        Ok(keys) => Ok((transport, info, keys)),
+        Err(e) => {
+            progress(
+                "pair-setup",
+                false,
+                &format!("transient failed ({e}); receiver requires a pairing code"),
+            );
+            // Ask the receiver to show its PIN (best effort on this conn).
+            let _ = pairing::pair_pin_start(&mut transport);
+            // Prompt the caller (stdin / tray dialog) for the displayed code.
+            let code = match pin_provider() {
+                Some(p) if !p.trim().is_empty() => p.trim().to_string(),
+                _ => {
+                    return Err(
+                        e.context("receiver requires a pairing code, but none was provided")
+                    )
+                }
+            };
+            progress("pin", true, "got pairing code; reconnecting");
+            // Reconnect on a FRESH socket — the failed attempt dirtied it.
+            drop(transport);
+            let mut t2 = Transport::connect(host, port).context("reconnect for PIN pairing")?;
+            let mut info2 = info::get_info(&mut t2).unwrap_or_default();
+            if info2.pk.is_empty() && !mdns_pk.is_empty() {
+                info2.pk = mdns_pk.to_vec();
+            }
+            let keys = do_pairing(&mut t2, &mut info2, &code, pairing_id, reuse_seed, progress)?;
+            // Re-save credentials after a successful PIN pairing (main.go:222-226).
+            let _ = cred_store
+                .save(device_id, pairing_id, &keys.ed25519_public, &keys.ed25519_seed)
+                .map(|_| progress("credentials", true, "saved pairing identity"));
+            Ok((t2, info2, keys))
+        }
     }
 }
 
@@ -664,6 +789,19 @@ fn do_pairing(
     Ok(keys)
 }
 
+/// Choose the credential-store key for a receiver: its stable AirPlay device id
+/// when known, falling back to the host/IP. Mirrors doubletake's keying, which
+/// stores credentials under `info.DeviceID` (main.go:139) — the device id is
+/// stable across IP/port changes, so a saved pairing identity is recognised on
+/// the next run even if the receiver moved to a new address.
+fn credential_key(device_id: &str, host: &str) -> String {
+    if device_id.is_empty() {
+        host.to_string()
+    } else {
+        device_id.to_string()
+    }
+}
+
 /// Decode a lowercase/uppercase hex string into bytes; returns empty on any
 /// malformed input (used for the optional mDNS `pk` record).
 fn decode_hex(s: &str) -> Vec<u8> {
@@ -684,4 +822,26 @@ fn decode_hex(s: &str) -> Vec<u8> {
         i += 2;
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::credential_key;
+
+    /// Credential-store keying choice (doubletake main.go:139 keys on
+    /// info.DeviceID): prefer the stable AirPlay device id, fall back to the
+    /// host/IP only when no device id is known.
+    #[test]
+    fn credential_key_prefers_device_id() {
+        // A real device id is used verbatim, regardless of the host.
+        assert_eq!(
+            credential_key("AA:BB:CC:DD:EE:FF", "192.168.1.50"),
+            "AA:BB:CC:DD:EE:FF"
+        );
+        // No device id -> fall back to the host/IP.
+        assert_eq!(credential_key("", "192.168.1.50"), "192.168.1.50");
+        // The explicit host path (connect_host_with) passes host as both the
+        // host and an empty device id, so it keys on the host.
+        assert_eq!(credential_key("", "appletv.local"), "appletv.local");
+    }
 }

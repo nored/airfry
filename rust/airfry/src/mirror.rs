@@ -37,7 +37,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use aes::cipher::{KeyIvInit, StreamCipher};
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use chacha20poly1305::aead::{Aead, KeyInit, Payload};
 use chacha20poly1305::ChaCha20Poly1305;
 use hkdf::Hkdf;
@@ -62,8 +62,24 @@ pub struct MirrorOpts {
     /// Skip audio capture/streaming entirely (video-only mirror).
     pub no_audio: bool,
     /// Stream audio but tell the receiver to mute it (SET_PARAMETER volume
-    /// -144 dB). Audio frames are still sent.
+    /// -144 dB). Audio frames are still sent. This is the *startup* mute; the
+    /// receiver can still be muted/unmuted at runtime via `MirrorControl`.
     pub mute_audio: bool,
+    /// Use shk/shiv directly for the AES-CTR video cipher without the SHA-512
+    /// derivation (mirror.go cfg.DirectKey, mirror.go:577-580). Only affects the
+    /// AES-CTR (plaintext/UxPlay) path; the ChaCha20 path is unaffected.
+    pub direct_key: bool,
+    /// Local UDP/TCP port range `[min, max]` (inclusive) the receiver can reach
+    /// back on (audio timing/control/data UDP + the event TCP listener). When
+    /// `None`, OS-ephemeral ports are used. Matches doubletake's -port-range /
+    /// parsePortRange + the allocateConsecutiveUDPPortsInRange / listenTCPInRange
+    /// allocators. Falls back to ephemeral when the range is exhausted is NOT
+    /// done — like Go, an exhausted explicit range is a hard error.
+    pub port_range: Option<(u16, u16)>,
+    /// Use the synthetic videotestsrc pipeline instead of real screen capture
+    /// (main.go -test / capture.go StartTestCapture). Lets mirroring run with no
+    /// display/portal. Forwarded to `CaptureConfig.test`.
+    pub test: bool,
 }
 
 impl Default for MirrorOpts {
@@ -76,7 +92,131 @@ impl Default for MirrorOpts {
             no_encrypt: false,
             no_audio: false,
             mute_audio: false,
+            direct_key: false,
+            port_range: None,
+            test: false,
         }
+    }
+}
+
+/// parsePortRange (cmd/doubletake/main.go:22-48) — parse a `"MIN-MAX"` string
+/// into inclusive port bounds. An empty/whitespace string yields `None` ("let
+/// the OS pick"). Validates 1..=65535, min<=max, and at least 4 ports (3 UDP +
+/// 1 TCP), matching Go exactly.
+pub fn parse_port_range(s: &str) -> Result<Option<(u16, u16)>> {
+    let s = s.trim();
+    if s.is_empty() {
+        return Ok(None);
+    }
+    let (lo_s, hi_s) = s
+        .split_once('-')
+        .ok_or_else(|| anyhow!("expected MIN-MAX, got {s:?}"))?;
+    let lo: i64 = lo_s
+        .trim()
+        .parse()
+        .map_err(|e| anyhow!("min: {e}"))?;
+    let hi: i64 = hi_s
+        .trim()
+        .parse()
+        .map_err(|e| anyhow!("max: {e}"))?;
+    if lo < 1 || hi > 65535 || lo > hi {
+        bail!("range {lo}-{hi} out of bounds (1-65535, min<=max)");
+    }
+    if hi - lo + 1 < 4 {
+        bail!("range {lo}-{hi} too small; need at least 4 ports (3 UDP + 1 TCP)");
+    }
+    Ok(Some((lo as u16, hi as u16)))
+}
+
+/// A shareable handle that lets an external controller (daemon/tray) drive a
+/// running mirror: stop it, and mute/unmute its audio at runtime. Construct one,
+/// pass it to `run_mirror_with_control`, and call `set_muted` from any thread.
+///
+/// The runtime mute is the analogue of mirror.go's `MirrorSession.SetAudioMuted`
+/// (mirror.go:1672-1688): it sends a SET_PARAMETER volume body on the control
+/// channel (`0.000000` unmuted, `-144.000000` muted). `run_mirror_with_control`
+/// populates the control transport + session URI once SETUP completes; before
+/// that, `set_muted` only records the desired state (applied at setup).
+#[derive(Clone)]
+pub struct MirrorControl {
+    stop: Arc<AtomicBool>,
+    /// Desired mute state. Seeded from `MirrorOpts.mute_audio` at setup and
+    /// updated by `set_muted`.
+    muted: Arc<AtomicBool>,
+    /// Set by run once the control channel + audio URI are ready. `None` until
+    /// then (or after teardown).
+    chan: Arc<Mutex<Option<MuteChannel>>>,
+}
+
+struct MuteChannel {
+    control: Arc<Mutex<Transport>>,
+    audio_uri: String,
+}
+
+/// SET_PARAMETER volume body for the muted state (mirror.go:1681).
+const VOLUME_MUTED: &[u8] = b"volume: -144.000000\r\n";
+/// SET_PARAMETER volume body for the unmuted (max, 0 dB) state (mirror.go:1679).
+const VOLUME_UNMUTED: &[u8] = b"volume: 0.000000\r\n";
+
+impl MirrorControl {
+    /// Create a control with a fresh stop flag.
+    pub fn new() -> Self {
+        Self::with_stop(Arc::new(AtomicBool::new(false)))
+    }
+
+    /// Create a control wrapping a caller-owned stop flag.
+    pub fn with_stop(stop: Arc<AtomicBool>) -> Self {
+        MirrorControl {
+            stop,
+            muted: Arc::new(AtomicBool::new(false)),
+            chan: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    /// The underlying stop flag (so the caller can also flip it directly).
+    pub fn stop_flag(&self) -> Arc<AtomicBool> {
+        self.stop.clone()
+    }
+
+    /// Request the mirror to stop.
+    pub fn stop(&self) {
+        self.stop.store(true, Ordering::Relaxed);
+    }
+
+    /// Current desired mute state.
+    pub fn is_muted(&self) -> bool {
+        self.muted.load(Ordering::Relaxed)
+    }
+
+    /// Mute/unmute the mirrored audio at runtime (mirror.go SetAudioMuted). When
+    /// the control channel is live this sends the SET_PARAMETER volume body
+    /// immediately; otherwise the state is recorded and applied at setup.
+    pub fn set_muted(&self, muted: bool) -> Result<()> {
+        self.muted.store(muted, Ordering::Relaxed);
+        let guard = self.chan.lock().unwrap();
+        if let Some(ch) = guard.as_ref() {
+            let body = if muted { VOLUME_MUTED } else { VOLUME_UNMUTED };
+            ch.control
+                .lock()
+                .unwrap()
+                .request("SET_PARAMETER", &ch.audio_uri, "text/parameters", body, &[])
+                .map_err(|e| anyhow!("set audio muted={muted}: {e}"))?;
+        }
+        Ok(())
+    }
+
+    fn bind(&self, control: Arc<Mutex<Transport>>, audio_uri: String) {
+        *self.chan.lock().unwrap() = Some(MuteChannel { control, audio_uri });
+    }
+
+    fn unbind(&self) {
+        *self.chan.lock().unwrap() = None;
+    }
+}
+
+impl Default for MirrorControl {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -774,17 +914,37 @@ fn uuid_to_mac(id: &str) -> String {
 /// capture stream ends or Ctrl-C is pressed. Faithful to mirror.go's
 /// setupMirrorSession + StreamFrames (video only).
 pub fn run_mirror(session: Session, opts: MirrorOpts) -> Result<()> {
-    run_mirror_with_stop(session, opts, Arc::new(AtomicBool::new(false)))
+    run_mirror_with_control(session, opts, MirrorControl::new())
 }
 
 /// Like `run_mirror`, but driven by a caller-owned stop flag so an external
-/// controller (e.g. the tray) can stop or switch the mirror at any time.
+/// controller (e.g. the tray) can stop or switch the mirror at any time. Kept
+/// for callers that only need stop control; for runtime mute/unmute use
+/// `run_mirror_with_control`.
 pub fn run_mirror_with_stop(
     session: Session,
     opts: MirrorOpts,
     stop: Arc<AtomicBool>,
 ) -> Result<()> {
+    run_mirror_with_control(session, opts, MirrorControl::with_stop(stop))
+}
+
+/// Like `run_mirror_with_stop`, but additionally accepts a `MirrorControl` so
+/// the daemon/tray can mute/unmute the audio while the mirror is running
+/// (mirror.go SetAudioMuted). The control's stop flag drives shutdown.
+pub fn run_mirror_with_control(
+    session: Session,
+    opts: MirrorOpts,
+    control_handle: MirrorControl,
+) -> Result<()> {
     use plist::Value;
+
+    let stop = control_handle.stop.clone();
+    // Seed the runtime mute state from the startup --mute flag so a controller
+    // that reads is_muted() / toggles from a known baseline behaves correctly.
+    control_handle
+        .muted
+        .store(opts.mute_audio, Ordering::Relaxed);
 
     // The mirror RTSP request line uses the full rtsp:// URI as the path. We
     // reconstruct host/port from the connected socket's peer address.
@@ -835,7 +995,8 @@ pub fn run_mirror_with_stop(
     // allocateConsecutiveUDPPortsInRange). The control + data sockets feed the
     // audio stream; the declared controlPort in the SETUP descriptor is N+1, the
     // socket we actually send sync packets from. ----
-    let audio_ports = allocate_consecutive_udp(3).context("allocate audio ports")?;
+    let audio_ports =
+        allocate_consecutive_udp(3, opts.port_range).context("allocate audio ports")?;
     let mut ports_iter = audio_ports.into_iter();
     let timing_sock = ports_iter.next().unwrap();
     let audio_ctrl_conn = Some(ports_iter.next().unwrap());
@@ -855,7 +1016,8 @@ pub fn run_mirror_with_stop(
     // (mirror.go:130-161). Go does NOT carry the sender's event port in the
     // SETUP plist; it reserves the listener and separately dials the receiver's
     // own eventPort read back from the SETUP response. ----
-    let event_listener = listen_tcp_avoiding(timing_port).context("listen event port")?;
+    let event_listener =
+        listen_tcp_avoiding(timing_port, opts.port_range).context("listen event port")?;
     let event_port = event_listener.local_addr()?.port();
     eprintln!("[mirror] event listener on TCP port {event_port}");
     {
@@ -1226,14 +1388,21 @@ pub fn run_mirror_with_stop(
         volume_body,
         &[],
     );
-    // --mute: separate post-setup SET_PARAMETER mirroring SetAudioMuted(true)
-    // (volume -144 dB = muted). The two initial sends above stay 0.000000.
-    if opts.mute_audio {
+    // Expose the control channel + audio URI to the MirrorControl so the
+    // daemon/tray can mute/unmute at runtime (mirror.go SetAudioMuted). Bound
+    // here, after RECORD/SETUP, once the session URI is valid.
+    control_handle.bind(control.clone(), audio_uri.clone());
+
+    // Apply the current desired mute state (seeded from --mute, or updated by an
+    // early set_muted call). When muted, this is the post-setup SET_PARAMETER
+    // mirroring SetAudioMuted(true) (volume -144 dB); the two initial sends above
+    // stay 0.000000. When unmuted nothing extra is sent (already at 0.000000).
+    if control_handle.muted.load(Ordering::Relaxed) {
         let _ = control.lock().unwrap().request(
             "SET_PARAMETER",
             &audio_uri,
             "text/parameters",
-            b"volume: -144.000000\r\n",
+            VOLUME_MUTED,
             &[],
         );
     }
@@ -1260,6 +1429,11 @@ pub fn run_mirror_with_stop(
             .map_err(|_| anyhow!("chacha key length"))?;
         eprintln!("[mirror] cipher: ChaCha20-Poly1305 (HKDF-SHA512)");
         VideoCipher::ChaCha { aead, nonce: 0 }
+    } else if opts.direct_key {
+        // direct-key (mirror.go:577-580): use shk/shiv directly, no SHA-512
+        // derivation. shk/shiv are the raw stream key/IV (enc_key/enc_iv).
+        eprintln!("[mirror] cipher: AES-128-CTR (DIRECT key, no SHA-512 derivation)");
+        VideoCipher::AesCtr(MirrorCipher::new(&enc_key, &enc_iv))
     } else {
         let (k, iv) = derive_video_keys(&enc_key, video_stream_connection_id);
         eprintln!("[mirror] cipher: AES-128-CTR (SHA-512 derived)");
@@ -1351,7 +1525,7 @@ pub fn run_mirror_with_stop(
                 ) {
                     Ok(stream) => {
                         let audio_stream = Arc::new(Mutex::new(stream));
-                        match audio::AudioCapture::start(false) {
+                        match audio::AudioCapture::start(opts.test) {
                             Ok(mut capture) => {
                                 eprintln!("[audio] capture started; streaming audio alongside video");
                                 let first_frame = first_frame.clone();
@@ -1393,6 +1567,9 @@ pub fn run_mirror_with_stop(
         bitrate_kbps: opts.bitrate_kbps,
         fit_pct: opts.fit_pct,
         force_software: opts.force_software_encoder,
+        test: opts.test,
+        restore_token: None,
+        on_restore_token: None,
     };
     let mut capture = CaptureSource::start(&capture_cfg).context("start capture")?;
     eprintln!("[mirror] streaming… (Ctrl-C to stop)");
@@ -1408,6 +1585,7 @@ pub fn run_mirror_with_stop(
     }
 
     // ---- TEARDOWN ----
+    control_handle.unbind();
     let _ = control
         .lock()
         .unwrap()
@@ -1416,62 +1594,101 @@ pub fn run_mirror_with_stop(
     result
 }
 
-/// allocateConsecutiveUDPPortsInRange (ephemeral path) — allocate `count`
-/// consecutive UDP ports: timing(N), control(N+1), data(N+2). The OS picks the
-/// base port; subsequent ports are base+1, base+2, … The Apple TV classifies
-/// incoming audio by source port and expects this consecutive pattern
-/// (mirror.go:1812-1871). Retries up to 20 times, matching Go.
-fn allocate_consecutive_udp(count: usize) -> Result<Vec<std::net::UdpSocket>> {
+/// try_consecutive_udp — bind `count` consecutive UDP ports starting at `base`.
+/// `base == 0` lets the OS pick the first port (subsequent are base+1, …).
+/// Returns the bound sockets on full success, else None (partials dropped).
+fn try_consecutive_udp(base: u16, count: usize) -> Option<Vec<std::net::UdpSocket>> {
     use std::net::UdpSocket;
-    for _ in 0..20 {
-        let first = match UdpSocket::bind("0.0.0.0:0") {
-            Ok(s) => s,
-            Err(_) => continue,
-        };
-        let base = match first.local_addr() {
-            Ok(a) => a.port(),
-            Err(_) => continue,
-        };
-        if base == 0 || (base as usize) + count - 1 > u16::MAX as usize {
-            continue;
-        }
-        let mut conns = vec![first];
-        let mut ok = true;
-        for i in 1..count {
-            match UdpSocket::bind(("0.0.0.0", base + i as u16)) {
-                Ok(c) => conns.push(c),
-                Err(_) => {
-                    ok = false;
-                    break;
-                }
-            }
-        }
-        if ok {
-            return Ok(conns);
-        }
-        // Drop the partial set and retry.
+    let first = UdpSocket::bind(("0.0.0.0", base)).ok()?;
+    let actual_base = first.local_addr().ok()?.port();
+    if actual_base == 0 || (actual_base as usize) + count - 1 > u16::MAX as usize {
+        return None;
     }
-    Err(anyhow!(
-        "could not allocate {count} consecutive UDP ports after 20 attempts"
-    ))
+    let mut conns = vec![first];
+    for i in 1..count {
+        match UdpSocket::bind(("0.0.0.0", actual_base + i as u16)) {
+            Ok(c) => conns.push(c),
+            Err(_) => return None, // partials dropped on return
+        }
+    }
+    Some(conns)
 }
 
-/// listenTCPInRange (ephemeral path) — open a TCP listener for the event
-/// channel. With an OS-assigned ephemeral port there is no range to scan; we
-/// re-bind until the chosen port does not overlap the audio UDP triple
-/// [skip_base, skip_base+2] (mirror.go:1873-1893).
-fn listen_tcp_avoiding(skip_base: u16) -> Result<std::net::TcpListener> {
+/// allocateConsecutiveUDPPortsInRange (mirror.go:1818-1850) — allocate `count`
+/// consecutive UDP ports: timing(N), control(N+1), data(N+2). The Apple TV
+/// classifies incoming audio by source port and expects this consecutive
+/// pattern. When `range` is `None`, the OS picks the base (retry 20×); otherwise
+/// the search is limited to `[min, max]` inclusive. An exhausted explicit range
+/// is a hard error (matching Go — no ephemeral fallback).
+fn allocate_consecutive_udp(
+    count: usize,
+    range: Option<(u16, u16)>,
+) -> Result<Vec<std::net::UdpSocket>> {
+    let (lo, hi) = match range {
+        None => {
+            for _ in 0..20 {
+                if let Some(conns) = try_consecutive_udp(0, count) {
+                    return Ok(conns);
+                }
+            }
+            return Err(anyhow!(
+                "could not allocate {count} consecutive UDP ports after 20 attempts"
+            ));
+        }
+        Some(r) => r,
+    };
+    if lo == 0 || hi == 0 || lo > hi {
+        bail!("invalid UDP port range {lo}-{hi}");
+    }
+    if ((hi - lo + 1) as usize) < count {
+        bail!("UDP port range {lo}-{hi} too small for {count} consecutive ports");
+    }
+    let mut base = lo;
+    while base as usize <= hi as usize - count + 1 {
+        if let Some(conns) = try_consecutive_udp(base, count) {
+            return Ok(conns);
+        }
+        base += 1;
+    }
+    bail!("no {count} consecutive free UDP ports in range {lo}-{hi}")
+}
+
+/// listenTCPInRange (mirror.go:1873-1893) — open a TCP listener for the event
+/// channel, avoiding the audio UDP triple `[skip_base, skip_base+2]`. When
+/// `range` is `None`, the OS picks an ephemeral port (re-bind until it doesn't
+/// overlap the triple); otherwise scan `[min, max]` for the first free port,
+/// skipping the triple. An exhausted explicit range is a hard error.
+fn listen_tcp_avoiding(
+    skip_base: u16,
+    range: Option<(u16, u16)>,
+) -> Result<std::net::TcpListener> {
     use std::net::TcpListener;
-    for _ in 0..32 {
-        let l = TcpListener::bind("0.0.0.0:0").context("listen event TCP")?;
-        let p = l.local_addr()?.port();
+    let (lo, hi) = match range {
+        None => {
+            for _ in 0..32 {
+                let l = TcpListener::bind("0.0.0.0:0").context("listen event TCP")?;
+                let p = l.local_addr()?.port();
+                if skip_base > 0 && p >= skip_base && p <= skip_base.saturating_add(2) {
+                    continue; // overlaps the audio UDP triple; re-bind.
+                }
+                return Ok(l);
+            }
+            return Err(anyhow!("no free TCP port for the event channel"));
+        }
+        Some(r) => r,
+    };
+    if lo == 0 || hi == 0 || lo > hi {
+        bail!("invalid TCP port range {lo}-{hi}");
+    }
+    for p in lo..=hi {
         if skip_base > 0 && p >= skip_base && p <= skip_base.saturating_add(2) {
-            // Overlaps the audio UDP triple; re-bind to get a different port.
             continue;
         }
-        return Ok(l);
+        if let Ok(l) = TcpListener::bind(("0.0.0.0", p)) {
+            return Ok(l);
+        }
     }
-    Err(anyhow!("no free TCP port for the event channel"))
+    bail!("no free TCP port in range {lo}-{hi}")
 }
 
 /// event_accept_loop — accept the receiver's inbound event (reverse) connection,
@@ -1952,4 +2169,53 @@ fn now_unix_nanos() -> u64 {
 /// errors (e.g. a handler already set) are ignored.
 fn ctrlc_set<F: Fn() + Send + 'static>(f: F) -> Result<()> {
     ctrlc::set_handler(f).map_err(|e| anyhow!("set ctrl-c handler: {e}"))
+}
+
+#[cfg(test)]
+mod mirror_feature_tests {
+    use super::*;
+
+    #[test]
+    fn parse_port_range_empty_is_none() {
+        assert_eq!(parse_port_range("").unwrap(), None);
+        assert_eq!(parse_port_range("   ").unwrap(), None);
+    }
+
+    #[test]
+    fn parse_port_range_valid() {
+        assert_eq!(parse_port_range("60000-60010").unwrap(), Some((60000, 60010)));
+        // exactly 4 ports is the minimum allowed.
+        assert_eq!(parse_port_range("100-103").unwrap(), Some((100, 103)));
+        // surrounding whitespace is trimmed (matches Go TrimSpace).
+        assert_eq!(parse_port_range(" 200 - 250 ").unwrap(), Some((200, 250)));
+    }
+
+    #[test]
+    fn parse_port_range_rejects_bad() {
+        assert!(parse_port_range("60000").is_err()); // no dash
+        assert!(parse_port_range("abc-def").is_err()); // non-numeric
+        assert!(parse_port_range("100-99").is_err()); // min > max
+        assert!(parse_port_range("0-10").is_err()); // min < 1
+        assert!(parse_port_range("60000-70000").is_err()); // max > 65535
+        assert!(parse_port_range("100-102").is_err()); // < 4 ports
+    }
+
+    #[test]
+    fn mute_body_bytes_match_go() {
+        // mirror.go SetAudioMuted: "0.000000" max / "-144.000000" muted, with a
+        // trailing CRLF — exactly what we send on the control channel.
+        assert_eq!(VOLUME_UNMUTED, b"volume: 0.000000\r\n");
+        assert_eq!(VOLUME_MUTED, b"volume: -144.000000\r\n");
+    }
+
+    #[test]
+    fn mirror_control_seeds_and_toggles_muted() {
+        let c = MirrorControl::new();
+        assert!(!c.is_muted());
+        // Before the control channel is bound, set_muted just records the state.
+        c.set_muted(true).unwrap();
+        assert!(c.is_muted());
+        c.set_muted(false).unwrap();
+        assert!(!c.is_muted());
+    }
 }

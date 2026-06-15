@@ -35,9 +35,15 @@ use gstreamer as gst;
 use gstreamer::prelude::*;
 use gstreamer_app as gst_app;
 
+/// Callback invoked with the XDG ScreenCast portal's returned restore token, so
+/// the caller can persist it (e.g. credentials.save_restore_token) and reuse it
+/// on the next run to avoid re-prompting. Mirrors capture.go's
+/// `CaptureConfig.SaveRestoreToken` (capture.go:24-25,75-79).
+pub type RestoreTokenCallback = Arc<dyn Fn(&str) + Send + Sync>;
+
 /// Capture configuration (subset of capture.go's CaptureConfig that the mirror
 /// pipeline actually uses).
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct CaptureConfig {
     /// Target frame rate (defaults to 30 if 0).
     pub fps: u32,
@@ -49,6 +55,32 @@ pub struct CaptureConfig {
     pub fit_pct: u8,
     /// Force the software encoder (x264enc). Useful where VA-API is absent.
     pub force_software: bool,
+    /// Use the synthetic videotestsrc pipeline (main.go -test / capture.go
+    /// StartTestCapture) instead of real screen capture. Runs with no
+    /// display/portal.
+    pub test: bool,
+    /// XDG ScreenCast portal restore token from a previous run (Wayland). When
+    /// set, ashpd is asked to restore the prior grant so the portal does not
+    /// re-prompt for the display (capture.go:24,71; daemon.go:533-537).
+    pub restore_token: Option<String>,
+    /// Invoked with the portal's NEW restore token once a session is granted, so
+    /// the caller can persist it for next time (capture.go:25,75-79;
+    /// daemon.go:729-733). Only fires on Wayland.
+    pub on_restore_token: Option<RestoreTokenCallback>,
+}
+
+impl std::fmt::Debug for CaptureConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CaptureConfig")
+            .field("fps", &self.fps)
+            .field("bitrate_kbps", &self.bitrate_kbps)
+            .field("fit_pct", &self.fit_pct)
+            .field("force_software", &self.force_software)
+            .field("test", &self.test)
+            .field("restore_token", &self.restore_token)
+            .field("on_restore_token", &self.on_restore_token.is_some())
+            .finish()
+    }
 }
 
 impl Default for CaptureConfig {
@@ -58,6 +90,9 @@ impl Default for CaptureConfig {
             bitrate_kbps: 0,
             fit_pct: 0,
             force_software: false,
+            test: false,
+            restore_token: None,
+            on_restore_token: None,
         }
     }
 }
@@ -65,6 +100,10 @@ impl Default for CaptureConfig {
 const DEFAULT_VIDEO_BITRATE_KBPS: u32 = 4500;
 const MIN_VIDEO_BITRATE_KBPS: u32 = 1800;
 const MAX_VIDEO_BITRATE_KBPS: u32 = 12000;
+
+/// Synthetic test-source dimensions (capture.go:35-36 testCaptureWidth/Height).
+const TEST_CAPTURE_WIDTH: i32 = 1920;
+const TEST_CAPTURE_HEIGHT: i32 = 1080;
 
 /// Read an env var, trying the AIRFRY_ name first and falling back to the
 /// DOUBLETAKE_ name (the original Go reads DOUBLETAKE_*; we honor both).
@@ -139,6 +178,10 @@ impl CaptureSource {
     pub fn start(cfg: &CaptureConfig) -> Result<CaptureSource> {
         gst::init().context("gst init")?;
 
+        if cfg.test {
+            return Self::start_test(cfg);
+        }
+
         if std::env::var_os("WAYLAND_DISPLAY").is_some() {
             Self::start_wayland(cfg)
         } else if std::env::var_os("DISPLAY").is_some() {
@@ -148,8 +191,118 @@ impl CaptureSource {
         }
     }
 
+    /// StartTestCapture (capture.go:484-553) — synthetic H.264 stream from
+    /// videotestsrc (pattern=18, the bouncing ball) + timeoverlay + x264enc High
+    /// profile, Annex-B byte-stream. Runs with no display/portal. Built in-process
+    /// with the same element graph the Go code passes to gst-launch-1.0.
+    fn start_test(cfg: &CaptureConfig) -> Result<CaptureSource> {
+        let fps = if cfg.fps == 0 { 30 } else { cfg.fps };
+        // captureBitrateKbps over the fixed test dims (capture.go:496).
+        let scale = OutputScale {
+            enc_w: TEST_CAPTURE_WIDTH,
+            enc_h: TEST_CAPTURE_HEIGHT,
+            scale_args: None,
+        };
+        let bitrate = capture_bitrate_kbps(cfg, &scale, fps);
+        let key_int = keyframe_interval_frames(fps);
+
+        eprintln!("[CAPTURE] test mode: videotestsrc pattern=18 ! timeoverlay ! x264enc (bitrate={bitrate} kbps)");
+
+        let pipeline = gst::Pipeline::new();
+
+        // videotestsrc pattern=18 (ball) is-live=true do-timestamp=true.
+        let src = gst::ElementFactory::make("videotestsrc")
+            .property_from_str("pattern", "ball")
+            .property("is-live", true)
+            .property("do-timestamp", true)
+            .build()
+            .context("create videotestsrc")?;
+        // video/x-raw,width,height,framerate.
+        let src_caps = gst::ElementFactory::make("capsfilter")
+            .property(
+                "caps",
+                &gst::Caps::builder("video/x-raw")
+                    .field("width", TEST_CAPTURE_WIDTH)
+                    .field("height", TEST_CAPTURE_HEIGHT)
+                    .field("framerate", gst::Fraction::new(fps as i32, 1))
+                    .build(),
+            )
+            .build()
+            .context("create test src capsfilter")?;
+        let timeoverlay = make("timeoverlay")?;
+        let videoconvert = make("videoconvert")?;
+        // x264enc tune=zerolatency speed-preset=superfast bitrate key-int-max
+        // threads=1 sliced-threads=true byte-stream=true (capture.go:508-515).
+        let enc = gst::ElementFactory::make("x264enc")
+            .property_from_str("tune", "zerolatency")
+            .property_from_str("speed-preset", "superfast")
+            .property("bitrate", bitrate)
+            .property("key-int-max", key_int)
+            .property("threads", 1u32)
+            .property("sliced-threads", true)
+            .property("byte-stream", true)
+            .build()
+            .context("create x264enc (install gst-plugins-ugly / libx264)")?;
+        // video/x-h264,profile=high,stream-format=byte-stream (capture.go:516).
+        let enc_caps = gst::ElementFactory::make("capsfilter")
+            .property(
+                "caps",
+                &gst::Caps::builder("video/x-h264")
+                    .field("profile", "high")
+                    .field("stream-format", "byte-stream")
+                    .build(),
+            )
+            .build()
+            .context("create test h264 capsfilter")?;
+
+        let appsink = gst_app::AppSink::builder()
+            .sync(false)
+            .max_buffers(8)
+            .drop(false)
+            .build();
+
+        let elems: Vec<gst::Element> = vec![
+            src,
+            src_caps,
+            timeoverlay,
+            videoconvert,
+            enc,
+            enc_caps,
+            appsink.upcast_ref::<gst::Element>().clone(),
+        ];
+        for e in elems.iter() {
+            pipeline.add(e).context("add test element")?;
+        }
+        gst::Element::link_many(elems.iter().collect::<Vec<_>>().as_slice())
+            .context("link test pipeline")?;
+
+        let (rx, eos) = wire_appsink(&appsink);
+
+        pipeline
+            .set_state(gst::State::Playing)
+            .context("set test pipeline PLAYING")?;
+
+        Ok(CaptureSource {
+            pipeline,
+            rx,
+            leftover: Vec::new(),
+            _portal: None,
+            eos,
+        })
+    }
+
     fn start_wayland(cfg: &CaptureConfig) -> Result<CaptureSource> {
-        let portal = request_screencast().context("screencast portal")?;
+        let portal =
+            request_screencast(cfg.restore_token.as_deref()).context("screencast portal")?;
+        // Surface the portal's (possibly new) restore token so the caller can
+        // persist it for next time (capture.go:75-79).
+        if let Some(token) = portal.restore_token.as_deref() {
+            if !token.is_empty() {
+                if let Some(cb) = &cfg.on_restore_token {
+                    cb(token);
+                }
+            }
+        }
         let (src_w, src_h) = portal.size;
         eprintln!(
             "[capture] portal node={} size={}x{}",
@@ -375,27 +528,7 @@ impl CaptureSource {
         gst::Element::link_many(elems.iter().collect::<Vec<_>>().as_slice())
             .context("link pipeline")?;
 
-        let (tx, rx): (Sender<Vec<u8>>, Receiver<Vec<u8>>) = mpsc::channel();
-        let eos = Arc::new(Mutex::new(false));
-        let eos_cb = eos.clone();
-        appsink.set_callbacks(
-            gst_app::AppSinkCallbacks::builder()
-                .new_sample(move |sink| {
-                    let sample = sink.pull_sample().map_err(|_| gst::FlowError::Eos)?;
-                    if let Some(buffer) = sample.buffer() {
-                        if let Ok(map) = buffer.map_readable() {
-                            if tx.send(map.as_slice().to_vec()).is_err() {
-                                return Err(gst::FlowError::Eos);
-                            }
-                        }
-                    }
-                    Ok(gst::FlowSuccess::Ok)
-                })
-                .eos(move |_sink| {
-                    *eos_cb.lock().unwrap() = true;
-                })
-                .build(),
-        );
+        let (rx, eos) = wire_appsink(&appsink);
 
         Ok((encoder, eos, rx))
     }
@@ -440,6 +573,33 @@ fn make(name: &str) -> Result<gst::Element> {
     gst::ElementFactory::make(name)
         .build()
         .with_context(|| format!("create {name}"))
+}
+
+/// Attach the new-sample/EOS callbacks to an appsink, pushing each encoded
+/// buffer through an mpsc channel. Returns the receiver and the shared EOS flag.
+fn wire_appsink(appsink: &gst_app::AppSink) -> (Receiver<Vec<u8>>, Arc<Mutex<bool>>) {
+    let (tx, rx): (Sender<Vec<u8>>, Receiver<Vec<u8>>) = mpsc::channel();
+    let eos = Arc::new(Mutex::new(false));
+    let eos_cb = eos.clone();
+    appsink.set_callbacks(
+        gst_app::AppSinkCallbacks::builder()
+            .new_sample(move |sink| {
+                let sample = sink.pull_sample().map_err(|_| gst::FlowError::Eos)?;
+                if let Some(buffer) = sample.buffer() {
+                    if let Ok(map) = buffer.map_readable() {
+                        if tx.send(map.as_slice().to_vec()).is_err() {
+                            return Err(gst::FlowError::Eos);
+                        }
+                    }
+                }
+                Ok(gst::FlowSuccess::Ok)
+            })
+            .eos(move |_sink| {
+                *eos_cb.lock().unwrap() = true;
+            })
+            .build(),
+    );
+    (rx, eos)
 }
 
 /// `! video/x-raw,framerate=<fps>/1`.
@@ -835,14 +995,30 @@ fn vbv_buffer_kbit(bitrate_kbps: u32, fps: u32) -> u32 {
 // OwnedFd of the portal's PipeWire remote (kept alive for the pipeline).
 // ---------------------------------------------------------------------------
 
-/// A live screencast portal session: holds the PipeWire remote fd and node id.
+/// A live screencast portal session: holds the PipeWire remote fd and node id,
+/// plus the restore token the portal returned (for persistence across runs).
 pub struct PortalSession {
     pub node_id: u32,
     pub size: (u32, u32),
     pub fd: OwnedFd,
+    /// The new restore token granted by the portal (capture.go newRestoreToken),
+    /// or None if the portal did not provide one. Present only when persistence
+    /// is granted.
+    pub restore_token: Option<String>,
 }
 
-fn request_screencast() -> Result<PortalSession> {
+/// requestScreencast (capture.go:741) — drive the XDG ScreenCast portal. `in_token`
+/// is the restore token from a previous run (capture.go's restoreToken arg): when
+/// present, ashpd asks the portal to restore the prior grant (no re-prompt). The
+/// portal's NEW restore token is captured and returned for the caller to persist.
+///
+/// Unlike the Go reference (which forces persist_mode 0 so GNOME always prompts),
+/// we honor the in-token and request `PersistMode::ExplicitlyRevoked` (persist
+/// until revoked) so a remembered grant is reused — the desired daemon/tray
+/// behavior. When no in-token is
+/// supplied this still requests persistence so the FIRST run produces a token to
+/// save.
+fn request_screencast(in_token: Option<&str>) -> Result<PortalSession> {
     use ashpd::desktop::screencast::{CursorMode, Screencast, SourceType};
     use ashpd::desktop::PersistMode;
     use ashpd::WindowIdentifier;
@@ -861,17 +1037,18 @@ fn request_screencast() -> Result<PortalSession> {
             .await
             .context("portal CreateSession")?;
 
-        // MONITOR source, embedded cursor, single source, no persistence — the
-        // GNOME portal then always prompts for the display (matches capture.go,
-        // which uses persist_mode 0 so "choose display" works reliably).
+        // MONITOR source, embedded cursor, single source. Request explicit
+        // persistence and replay any prior token so the grant is remembered
+        // across runs (capture.go restore-token flow).
+        let restore = in_token.filter(|t| !t.is_empty());
         proxy
             .select_sources(
                 &session,
                 CursorMode::Embedded,
                 SourceType::Monitor.into(),
                 false,
-                None,
-                PersistMode::DoNot,
+                restore,
+                PersistMode::ExplicitlyRevoked,
             )
             .await
             .context("portal SelectSources")?;
@@ -883,6 +1060,8 @@ fn request_screencast() -> Result<PortalSession> {
             .context("portal Start")?
             .response()
             .context("portal Start response")?;
+
+        let restore_token = response.restore_token().map(|s| s.to_string());
 
         let streams = response.streams();
         let stream = streams
@@ -899,6 +1078,11 @@ fn request_screencast() -> Result<PortalSession> {
             .await
             .context("portal OpenPipeWireRemote")?;
 
-        Ok(PortalSession { node_id, size, fd })
+        Ok(PortalSession {
+            node_id,
+            size,
+            fd,
+            restore_token,
+        })
     })
 }
