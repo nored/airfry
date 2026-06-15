@@ -1,0 +1,501 @@
+//! AirPlay / HomeKit pairing — faithful port of doubletake's
+//! internal/airplay/pairing.go (TLV8 path) plus the in-memory credential parts
+//! of credentials.go.
+//!
+//! Implements transient (PIN-less) and PIN-based SRP-6a pair-setup, followed by
+//! the HAP pair-verify that establishes the encrypted control channel.
+
+#![allow(dead_code)]
+
+use anyhow::{anyhow, bail, Result};
+use chacha20poly1305::aead::{Aead, KeyInit, Payload};
+use chacha20poly1305::ChaCha20Poly1305;
+use ed25519_dalek::{Signer, SigningKey};
+use hkdf::Hkdf;
+use num_bigint::BigUint;
+use num_traits::Zero;
+use rand::RngCore;
+use sha2::{Digest, Sha512};
+
+use crate::rtsp::Transport;
+use crate::tlv8::{self, Item};
+
+/// Transient-pairing flag (bit 4): ephemeral/no-PIN pairing.
+const PAIRING_FLAG_TRANSIENT: u32 = 0x0000_0010;
+
+/// Long-term + session keys produced by pairing.
+#[derive(Default, Clone)]
+pub struct PairKeys {
+    /// Long-term ed25519 identity public key (32 bytes).
+    pub ed25519_public: Vec<u8>,
+    /// Long-term ed25519 identity seed (32 bytes); the signing key derives from it.
+    pub ed25519_seed: Vec<u8>,
+    /// X25519 shared secret from pair-verify (32 bytes); empty before verify.
+    pub shared_secret: Vec<u8>,
+    /// HAP control-channel write/read keys (derived in pair-verify).
+    pub write_key: Vec<u8>,
+    pub read_key: Vec<u8>,
+}
+
+impl PairKeys {
+    fn signing_key(&self) -> Result<SigningKey> {
+        let seed: [u8; 32] = self
+            .ed25519_seed
+            .as_slice()
+            .try_into()
+            .map_err(|_| anyhow!("ed25519 seed must be 32 bytes"))?;
+        Ok(SigningKey::from_bytes(&seed))
+    }
+}
+
+/// RFC 5054 3072-bit SRP group N (hex), generator g = 5.
+const SRP_N_HEX: &str = "FFFFFFFFFFFFFFFFC90FDAA22168C234C4C6628B80DC1CD1\
+29024E088A67CC74020BBEA63B139B22514A08798E3404DD\
+EF9519B3CD3A431B302B0A6DF25F14374FE1356D6D51C245\
+E485B576625E7EC6F44C42E9A637ED6B0BFF5CB6F406B7ED\
+EE386BFB5A899FA5AE9F24117C4B1FE649286651ECE45B3D\
+C2007CB8A163BF0598DA48361C55D39A69163FA8FD24CF5F\
+83655D23DCA3AD961C62F356208552BB9ED529077096966D\
+670C354E4ABC9804F1746C08CA18217C32905E462E36CE3B\
+E39E772C180E86039B2783A2EC07A28FB5C55DF06F4C52C9\
+DE2BCBF6955817183995497CEA956AE515D2261898FA0510\
+15728E5A8AAAC42DAD33170D04507A33A85521ABDF1CBA64\
+ECFB850458DBEF0A8AEA71575D060C7DB3970F85A6E1E4C7\
+ABF5AE8CDB0933D71E8C94E04A25619DCEE3D2261AD2EE6B\
+F12FFA06D98A0864D87602733EC86A64521F2B18177B200C\
+BBE117577A615D6C770988C0BAD946E208E24FA074E5AB31\
+43DB5BFCE0FD108E4B82D120A93AD2CAFFFFFFFFFFFFFFFF";
+
+fn srp_n() -> BigUint {
+    BigUint::parse_bytes(SRP_N_HEX.as_bytes(), 16).expect("valid SRP N")
+}
+
+fn srp_g() -> BigUint {
+    BigUint::from(5u32)
+}
+
+/// Generate a random UUID (v4-ish, matching the Go `generateUUID` shape used
+/// for PairingID / SessionID).
+pub fn generate_uuid() -> String {
+    let mut b = [0u8; 16];
+    rand::thread_rng().fill_bytes(&mut b);
+    b[6] = (b[6] & 0x0f) | 0x40; // version 4
+    b[8] = (b[8] & 0x3f) | 0x80; // variant
+    format!(
+        "{:02X}{:02X}{:02X}{:02X}-{:02X}{:02X}-{:02X}{:02X}-{:02X}{:02X}-{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}",
+        b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7], b[8], b[9], b[10], b[11], b[12], b[13], b[14], b[15]
+    )
+}
+
+fn sha512(parts: &[&[u8]]) -> [u8; 64] {
+    let mut h = Sha512::new();
+    for p in parts {
+        h.update(p);
+    }
+    let out = h.finalize();
+    let mut r = [0u8; 64];
+    r.copy_from_slice(&out);
+    r
+}
+
+/// HKDF-SHA512 -> `length` bytes.
+fn hkdf_sha512(secret: &[u8], salt: &[u8], info: &[u8], length: usize) -> Vec<u8> {
+    let hk = Hkdf::<Sha512>::new(Some(salt), secret);
+    let mut okm = vec![0u8; length];
+    hk.expand(info, &mut okm).expect("hkdf expand");
+    okm
+}
+
+/// Left-pad a big-endian byte slice with zeros to `size` bytes.
+fn pad_to(data: &[u8], size: usize) -> Vec<u8> {
+    if data.len() >= size {
+        return data.to_vec();
+    }
+    let mut padded = vec![0u8; size];
+    padded[size - data.len()..].copy_from_slice(data);
+    padded
+}
+
+fn pair_headers() -> &'static [(&'static str, &'static str)] {
+    &[("X-Apple-HKP", "3")]
+}
+
+/// Run pair-setup. An empty `pin` performs the transient flow; otherwise PIN.
+/// Generates a fresh ed25519 identity and returns the resulting `PairKeys`
+/// (without the X25519 shared secret, which pair-verify fills in).
+pub fn pair_setup(transport: &mut Transport, pairing_id: &str, pin: &str) -> Result<PairKeys> {
+    // Generate ed25519 identity for this session.
+    let mut seed = [0u8; 32];
+    rand::thread_rng().fill_bytes(&mut seed);
+    let signing = SigningKey::from_bytes(&seed);
+    let mut keys = PairKeys {
+        ed25519_public: signing.verifying_key().to_bytes().to_vec(),
+        ed25519_seed: seed.to_vec(),
+        ..Default::default()
+    };
+
+    let (salt, server_pub) = if pin.is_empty() {
+        // Transient M1: method=0, state=1, flags=transient.
+        let m1 = tlv8::encode(&[
+            Item::new(tlv8::TLV_METHOD, vec![0x00]),
+            Item::new(tlv8::TLV_STATE, vec![0x01]),
+            Item::new(tlv8::TLV_FLAGS, PAIRING_FLAG_TRANSIENT.to_le_bytes().to_vec()),
+        ]);
+        let resp = transport.request(
+            "POST",
+            "/pair-setup",
+            "application/octet-stream",
+            &m1,
+            pair_headers(),
+        )?;
+        let m2 = tlv8::decode(&resp.body);
+        if let Some(e) = m2.get(&tlv8::TLV_ERROR) {
+            bail!("pair-setup M2 error: {}", e.first().copied().unwrap_or(0));
+        }
+        let server_pub = m2
+            .get(&tlv8::TLV_PUBLIC_KEY)
+            .cloned()
+            .ok_or_else(|| anyhow!("M2: missing server public key"))?;
+        // Transient: salt may be present; pass empty if absent.
+        let salt = m2.get(&tlv8::TLV_SALT).cloned().unwrap_or_default();
+        (salt, server_pub)
+    } else {
+        // PIN-based M1: method=0, state=1.
+        let m1 = tlv8::encode(&[
+            Item::new(tlv8::TLV_METHOD, vec![0x00]),
+            Item::new(tlv8::TLV_STATE, vec![0x01]),
+        ]);
+        let resp = transport.request(
+            "POST",
+            "/pair-setup",
+            "application/octet-stream",
+            &m1,
+            pair_headers(),
+        )?;
+        let m2 = tlv8::decode(&resp.body);
+        if let Some(e) = m2.get(&tlv8::TLV_ERROR) {
+            bail!("pair-setup M2 error: {}", e.first().copied().unwrap_or(0));
+        }
+        let salt = m2
+            .get(&tlv8::TLV_SALT)
+            .cloned()
+            .ok_or_else(|| anyhow!("M2: missing salt"))?;
+        let server_pub = m2
+            .get(&tlv8::TLV_PUBLIC_KEY)
+            .cloned()
+            .ok_or_else(|| anyhow!("M2: missing public key"))?;
+        (salt, server_pub)
+    };
+
+    complete_srp_exchange(transport, pairing_id, pin, &salt, &server_pub, &mut keys)?;
+    Ok(keys)
+}
+
+/// Finish SRP from M3 onward (shared by transient + PIN flows). Sets
+/// `keys.shared_secret = K` on success (overwritten by pair-verify later).
+fn complete_srp_exchange(
+    transport: &mut Transport,
+    pairing_id: &str,
+    pin: &str,
+    salt: &[u8],
+    server_pub_b: &[u8],
+    keys: &mut PairKeys,
+) -> Result<()> {
+    let n = srp_n();
+    let g = srp_g();
+
+    let username = b"Pair-Setup".to_vec();
+    let password = pin.as_bytes().to_vec();
+
+    // x = H(salt || H(username || ":" || password))
+    let mut inner = username.clone();
+    inner.push(b':');
+    inner.extend_from_slice(&password);
+    let inner_hash = sha512(&[&inner]);
+    let x_hash = sha512(&[salt, &inner_hash]);
+    let x = BigUint::from_bytes_be(&x_hash);
+
+    // k = H(pad(N) || pad(g))   (both padded to 384 bytes)
+    let pad_n = pad_to(&n.to_bytes_be(), 384);
+    let pad_g = pad_to(&g.to_bytes_be(), 384);
+    let k_hash = sha512(&[&pad_n, &pad_g]);
+    let k = BigUint::from_bytes_be(&k_hash);
+
+    // a (random 32 bytes), A = g^a mod N
+    let mut a_bytes = [0u8; 32];
+    rand::thread_rng().fill_bytes(&mut a_bytes);
+    let a = BigUint::from_bytes_be(&a_bytes);
+    let a_pub = g.modpow(&a, &n);
+
+    let b_pub = BigUint::from_bytes_be(server_pub_b);
+
+    // u = H(pad(A) || pad(B))
+    let u_hash = sha512(&[
+        &pad_to(&a_pub.to_bytes_be(), 384),
+        &pad_to(&b_pub.to_bytes_be(), 384),
+    ]);
+    let u = BigUint::from_bytes_be(&u_hash);
+
+    // S = (B - k * g^x)^(a + u*x) mod N
+    let gx = g.modpow(&x, &n);
+    let kgx = (&k * &gx) % &n;
+    let diff = if b_pub >= kgx {
+        (&b_pub - &kgx) % &n
+    } else {
+        // (B - kgx) mod N with wraparound
+        (&n - ((&kgx - &b_pub) % &n)) % &n
+    };
+    let exp = &a + &u * &x;
+    let s = diff.modpow(&exp, &n);
+
+    // K = H(S)  (S in natural unpadded big-endian)
+    let s_bytes = if s.is_zero() {
+        Vec::new()
+    } else {
+        s.to_bytes_be()
+    };
+    let big_k = sha512(&[&s_bytes]).to_vec();
+
+    // M1 proof = H( (H(N) XOR H(g)) || H(I) || salt || A || B || K )
+    let hn = sha512(&[&n.to_bytes_be()]);
+    let hg = sha512(&[&g.to_bytes_be()]);
+    let mut hxor = [0u8; 64];
+    for i in 0..64 {
+        hxor[i] = hn[i] ^ hg[i];
+    }
+    let hu = sha512(&[&username]);
+    let a_nat = a_pub.to_bytes_be();
+    let b_nat = b_pub.to_bytes_be();
+    let m1_proof = sha512(&[&hxor, &hu, salt, &a_nat, &b_nat, &big_k]);
+
+    // M3: state=3, publicKey=pad(A,384), proof=M1.
+    let m3 = tlv8::encode(&[
+        Item::new(tlv8::TLV_STATE, vec![0x03]),
+        Item::new(tlv8::TLV_PUBLIC_KEY, pad_to(&a_nat, 384)),
+        Item::new(tlv8::TLV_PROOF, m1_proof.to_vec()),
+    ]);
+    let resp = transport.request(
+        "POST",
+        "/pair-setup",
+        "application/octet-stream",
+        &m3,
+        pair_headers(),
+    )?;
+    let m4 = tlv8::decode(&resp.body);
+    if let Some(e) = m4.get(&tlv8::TLV_ERROR) {
+        bail!("pair-setup M4 error: {}", e.first().copied().unwrap_or(0));
+    }
+
+    // Verify server proof H(A || M1 || K) when provided.
+    let m2_proof_expected = sha512(&[&a_nat, &m1_proof, &big_k]);
+    if let Some(server_proof) = m4.get(&tlv8::TLV_PROOF) {
+        if server_proof.as_slice() != m2_proof_expected.as_slice() {
+            bail!("server proof mismatch");
+        }
+    }
+
+    // M5: encrypted sub-TLV with our ed25519 identity.
+    let session_key = hkdf_sha512(
+        &big_k,
+        b"Pair-Setup-Encrypt-Salt",
+        b"Pair-Setup-Encrypt-Info",
+        32,
+    );
+    let client_id = pairing_id.as_bytes().to_vec();
+    let sig_key = hkdf_sha512(
+        &big_k,
+        b"Pair-Setup-Controller-Sign-Salt",
+        b"Pair-Setup-Controller-Sign-Info",
+        32,
+    );
+
+    // signed message = sigKey || clientID || ed25519Pub
+    let mut sig_input = Vec::new();
+    sig_input.extend_from_slice(&sig_key);
+    sig_input.extend_from_slice(&client_id);
+    sig_input.extend_from_slice(&keys.ed25519_public);
+    let signing = keys.signing_key()?;
+    let signature = signing.sign(&sig_input).to_bytes().to_vec();
+
+    let sub_tlv = tlv8::encode(&[
+        Item::new(tlv8::TLV_IDENTIFIER, client_id.clone()),
+        Item::new(tlv8::TLV_PUBLIC_KEY, keys.ed25519_public.clone()),
+        Item::new(tlv8::TLV_SIGNATURE, signature),
+    ]);
+
+    let cipher = ChaCha20Poly1305::new_from_slice(&session_key)
+        .map_err(|_| anyhow!("chacha20 key"))?;
+    let mut nonce = [0u8; 12];
+    nonce[4..].copy_from_slice(b"PS-Msg05");
+    let encrypted = cipher
+        .encrypt(
+            (&nonce).into(),
+            Payload {
+                msg: &sub_tlv,
+                aad: &[],
+            },
+        )
+        .map_err(|_| anyhow!("M5 seal failed"))?;
+
+    let m5 = tlv8::encode(&[
+        Item::new(tlv8::TLV_STATE, vec![0x05]),
+        Item::new(tlv8::TLV_ENCRYPTED_DATA, encrypted),
+    ]);
+    let resp = transport.request(
+        "POST",
+        "/pair-setup",
+        "application/octet-stream",
+        &m5,
+        pair_headers(),
+    )?;
+    let m6 = tlv8::decode(&resp.body);
+    if let Some(e) = m6.get(&tlv8::TLV_ERROR) {
+        bail!("pair-setup M6 error: {}", e.first().copied().unwrap_or(0));
+    }
+
+    keys.shared_secret = big_k;
+    Ok(())
+}
+
+/// HAP pair-verify: ephemeral X25519, derives the encrypted control channel.
+/// On success enables HAP encryption on `transport` and sets the X25519 shared
+/// secret + write/read keys in `keys`.
+pub fn pair_verify(
+    transport: &mut Transport,
+    pairing_id: &str,
+    keys: &mut PairKeys,
+) -> Result<()> {
+    use x25519_dalek::{PublicKey, StaticSecret};
+
+    // Ephemeral X25519 key pair.
+    let mut priv_bytes = [0u8; 32];
+    rand::thread_rng().fill_bytes(&mut priv_bytes);
+    let client_secret = StaticSecret::from(priv_bytes);
+    let client_public = PublicKey::from(&client_secret);
+    let client_pub_bytes = client_public.to_bytes();
+
+    // V1: state=1, publicKey=clientX25519.
+    let v1 = tlv8::encode(&[
+        Item::new(tlv8::TLV_STATE, vec![0x01]),
+        Item::new(tlv8::TLV_PUBLIC_KEY, client_pub_bytes.to_vec()),
+    ]);
+    let resp = transport.request(
+        "POST",
+        "/pair-verify",
+        "application/octet-stream",
+        &v1,
+        pair_headers(),
+    )?;
+    let v2 = tlv8::decode(&resp.body);
+    if let Some(e) = v2.get(&tlv8::TLV_ERROR) {
+        bail!("pair-verify V2 error: {}", e.first().copied().unwrap_or(0));
+    }
+
+    let server_key_data = v2
+        .get(&tlv8::TLV_PUBLIC_KEY)
+        .cloned()
+        .ok_or_else(|| anyhow!("V2: missing server public key"))?;
+    if server_key_data.len() < 32 {
+        bail!("V2: server public key too short");
+    }
+    let mut server_public_bytes = [0u8; 32];
+    server_public_bytes.copy_from_slice(&server_key_data[..32]);
+    let server_public = PublicKey::from(server_public_bytes);
+
+    // X25519 shared secret.
+    let shared = client_secret.diffie_hellman(&server_public);
+    let shared_bytes = shared.to_bytes();
+
+    let verify_key = hkdf_sha512(
+        &shared_bytes,
+        b"Pair-Verify-Encrypt-Salt",
+        b"Pair-Verify-Encrypt-Info",
+        32,
+    );
+
+    // Decrypt+verify server's encrypted blob if present (nonce PV-Msg02).
+    if let Some(server_encrypted) = v2.get(&tlv8::TLV_ENCRYPTED_DATA) {
+        if !server_encrypted.is_empty() {
+            let cipher = ChaCha20Poly1305::new_from_slice(&verify_key)
+                .map_err(|_| anyhow!("chacha20 key"))?;
+            let mut nonce = [0u8; 12];
+            nonce[4..].copy_from_slice(b"PV-Msg02");
+            cipher
+                .decrypt(
+                    (&nonce).into(),
+                    Payload {
+                        msg: server_encrypted,
+                        aad: &[],
+                    },
+                )
+                .map_err(|_| anyhow!("decrypt V2 failed"))?;
+        }
+    }
+
+    // V3: signed (clientX25519 || pairingID || serverX25519), encrypted (PV-Msg03).
+    let client_id = pairing_id.as_bytes().to_vec();
+    let mut sig_input = Vec::new();
+    sig_input.extend_from_slice(&client_pub_bytes);
+    sig_input.extend_from_slice(&client_id);
+    sig_input.extend_from_slice(&server_public_bytes);
+    let signing = keys.signing_key()?;
+    let signature = signing.sign(&sig_input).to_bytes().to_vec();
+
+    let sub_tlv = tlv8::encode(&[
+        Item::new(tlv8::TLV_IDENTIFIER, client_id),
+        Item::new(tlv8::TLV_SIGNATURE, signature),
+    ]);
+
+    let cipher = ChaCha20Poly1305::new_from_slice(&verify_key)
+        .map_err(|_| anyhow!("chacha20 key"))?;
+    let mut nonce = [0u8; 12];
+    nonce[4..].copy_from_slice(b"PV-Msg03");
+    let encrypted = cipher
+        .encrypt(
+            (&nonce).into(),
+            Payload {
+                msg: &sub_tlv,
+                aad: &[],
+            },
+        )
+        .map_err(|_| anyhow!("V3 seal failed"))?;
+
+    let v3 = tlv8::encode(&[
+        Item::new(tlv8::TLV_STATE, vec![0x03]),
+        Item::new(tlv8::TLV_ENCRYPTED_DATA, encrypted),
+    ]);
+    let resp = transport.request(
+        "POST",
+        "/pair-verify",
+        "application/octet-stream",
+        &v3,
+        pair_headers(),
+    )?;
+    if !resp.body.is_empty() {
+        let v4 = tlv8::decode(&resp.body);
+        if let Some(e) = v4.get(&tlv8::TLV_ERROR) {
+            bail!("pair-verify V4 error: {}", e.first().copied().unwrap_or(0));
+        }
+    }
+
+    // Derive HAP control-channel keys; enable encryption on the transport.
+    let write_key = hkdf_sha512(
+        &shared_bytes,
+        b"Control-Salt",
+        b"Control-Write-Encryption-Key",
+        32,
+    );
+    let read_key = hkdf_sha512(
+        &shared_bytes,
+        b"Control-Salt",
+        b"Control-Read-Encryption-Key",
+        32,
+    );
+
+    keys.shared_secret = shared_bytes.to_vec();
+    keys.write_key = write_key.clone();
+    keys.read_key = read_key.clone();
+
+    transport.enable_encryption(write_key, read_key);
+    Ok(())
+}
