@@ -64,6 +64,10 @@ pub struct CaptureConfig {
     /// StartTestCapture) instead of real screen capture. Runs with no
     /// display/portal.
     pub test: bool,
+    /// Size of the receiver's display from its GET /info (`(0, 0)` = unknown).
+    /// A larger screen is scaled down to fit inside it, keeping the aspect
+    /// ratio; a smaller one is sent as is. $OUTPUT_HEIGHT overrides it.
+    pub max_size: (u32, u32),
     /// XDG ScreenCast portal restore token from a previous run (Wayland). When
     /// set, ashpd is asked to restore the prior grant so the portal does not
     /// re-prompt for the display (capture.go:24,71; daemon.go:533-537).
@@ -82,6 +86,7 @@ impl std::fmt::Debug for CaptureConfig {
             .field("fit_pct", &self.fit_pct)
             .field("force_software", &self.force_software)
             .field("test", &self.test)
+            .field("max_size", &self.max_size)
             .field("restore_token", &self.restore_token)
             .field("on_restore_token", &self.on_restore_token.is_some())
             .finish()
@@ -97,6 +102,7 @@ impl Default for CaptureConfig {
             live_underscan: false,
             force_software: false,
             test: false,
+            max_size: (0, 0),
             restore_token: None,
             on_restore_token: None,
         }
@@ -129,6 +135,52 @@ fn output_height_env() -> i32 {
     env_var("OUTPUT_HEIGHT")
         .and_then(|s| s.parse().ok())
         .unwrap_or(0)
+}
+
+/// The largest size with the source's aspect ratio that fits inside `max`, or
+/// `None` when the source already fits or `max` is unknown. Never scales up.
+fn fit_inside(src_w: i32, src_h: i32, max: (u32, u32)) -> Option<(i32, i32)> {
+    let (max_w, max_h) = (i64::from(max.0), i64::from(max.1));
+    let (src_w, src_h) = (i64::from(src_w), i64::from(src_h));
+    if max_w <= 0 || max_h <= 0 || src_w <= 0 || src_h <= 0 || (src_w <= max_w && src_h <= max_h) {
+        return None;
+    }
+    // Compare src_w/src_h with max_w/max_h without dividing.
+    let (w, h) = if src_w * max_h > max_w * src_h {
+        (max_w, src_h * max_w / src_w)
+    } else {
+        (src_w * max_h / src_h, max_h)
+    };
+    Some((w as i32, h as i32))
+}
+
+#[cfg(test)]
+mod fit_inside_tests {
+    use super::fit_inside;
+
+    #[test]
+    fn scales_a_larger_screen_down_to_the_display_height() {
+        // 3:2 laptop to a 1080p TV: height decides.
+        assert_eq!(fit_inside(2215, 1476, (1920, 1080)), Some((1620, 1080)));
+    }
+
+    #[test]
+    fn scales_a_wide_screen_down_to_the_display_width() {
+        // 21:9 monitor to a 1080p TV: width decides.
+        assert_eq!(fit_inside(3440, 1440, (1920, 1080)), Some((1920, 803)));
+    }
+
+    #[test]
+    fn leaves_a_screen_that_fits_alone() {
+        assert_eq!(fit_inside(2215, 1476, (3840, 2160)), None);
+        assert_eq!(fit_inside(1920, 1080, (1920, 1080)), None);
+    }
+
+    #[test]
+    fn leaves_the_size_alone_when_the_display_is_unknown() {
+        assert_eq!(fit_inside(2215, 1476, (0, 0)), None);
+        assert_eq!(fit_inside(0, 0, (1920, 1080)), None);
+    }
 }
 
 /// $DOUBLETAKE_FIT_PCT (applyOutputScale, capture.go:613). When set it
@@ -766,9 +818,10 @@ enum ScaleArgs {
 
 impl OutputScale {
     /// applyOutputScale (capture.go:587). `src_w`/`src_h` are the native source
-    /// dimensions (0 → unknown). Computes the encoded size (native, or scaled to
-    /// $OUTPUT_HEIGHT) and the videoscale/videobox segment, with the fit border
-    /// applied to the POST-scale dims.
+    /// dimensions (0 → unknown). Computes the encoded size (native, scaled to
+    /// $OUTPUT_HEIGHT, or fitted inside `cfg.max_size`) and the
+    /// videoscale/videobox segment, with the fit border applied to the
+    /// POST-scale dims.
     fn compute(cfg: &CaptureConfig, src_w: i32, src_h: i32) -> OutputScale {
         if src_w <= 0 || src_h <= 0 {
             return OutputScale {
@@ -778,13 +831,22 @@ impl OutputScale {
             };
         }
 
-        // Encoded frame size: native, or scaled to $OUTPUT_HEIGHT.
+        // Encoded frame size: native, scaled to $OUTPUT_HEIGHT, or scaled down
+        // to fit the receiver's display.
         let mut tw = src_w;
         let mut th = src_h;
         let oh = output_height_env();
         if oh > 0 {
             th = oh;
             tw = src_w * oh / src_h;
+        } else if let Some((w, h)) = fit_inside(src_w, src_h, cfg.max_size) {
+            crate::dlog!(
+                "[capture] scaling {src_w}x{src_h} down to {w}x{h} for the receiver's {}x{} display",
+                cfg.max_size.0,
+                cfg.max_size.1
+            );
+            tw = w;
+            th = h;
         }
         tw -= tw % 2;
         th -= th % 2;
