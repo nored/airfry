@@ -538,7 +538,7 @@ fn cmd_daemon(args: &[String]) -> i32 {
         eprintln!("{e}");
         return 2;
     }
-    match daemon::run(flags.socket_path) {
+    match daemon::run(flags.socket_path, flags.opts.port_range) {
         Ok(()) => 0,
         Err(e) => {
             eprintln!("daemon error: {e:#}");
