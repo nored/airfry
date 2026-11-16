@@ -19,6 +19,8 @@ mod icon;
 mod info;
 mod latency;
 mod mirror;
+// Legacy AirPlay pairing for UxPlay receivers.
+mod legacy;
 mod pairing;
 mod playfair;
 mod protocol;

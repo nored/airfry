@@ -22,6 +22,7 @@ use crate::credentials::CredentialStore;
 use crate::discovery::AirPlayDevice;
 use crate::fairplay::{self, FairPlayKeys};
 use crate::info::{self, ReceiverInfo};
+use crate::legacy;
 use crate::pairing::{self, PairKeys};
 
 const USER_AGENT: &str = "AirPlay/935.7.1";
@@ -645,7 +646,26 @@ impl Session {
         //      PIN prompt + fresh-reconnect PIN pairing (main.go:204-228).
         let pair_keys: PairKeys;
 
-        if !pin.is_empty() {
+        if legacy::is_legacy_receiver(&info) {
+            // UxPlay-style receiver (no HomeKit feature bits): it rejects the
+            // TLV8 pairing below, so pair the legacy AirPlay way instead.
+            // Apple TVs never take this branch.
+            // The SRP user is the SETUP deviceID, so UxPlay -reg can register us.
+            let saved_keys = saved
+                .as_ref()
+                .filter(|c| c.has_pairing_credentials())
+                .and_then(|c| c.ed25519_keys());
+            let user = crate::mirror::uuid_to_mac(&session_id);
+            let (keys, save) = legacy::pair(
+                &mut transport, &mut info, host, port, pin, saved_keys, &user, pin_provider, progress,
+            )?;
+            if save {
+                let _ = cred_store
+                    .save(device_id, &pairing_id, &keys.ed25519_public, &keys.ed25519_seed)
+                    .map(|_| progress("credentials", true, "saved pairing identity"));
+            }
+            pair_keys = keys;
+        } else if !pin.is_empty() {
             // (1) Explicit PIN: full PIN pairing, then persist the identity
             // (main.go:142-161).
             let keys = do_pairing(&mut transport, &mut info, pin, &pairing_id, reuse_seed, progress)?;

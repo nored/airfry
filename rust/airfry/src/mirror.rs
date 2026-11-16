@@ -949,7 +949,8 @@ fn generate_uuid() -> String {
 }
 
 /// uuidToMAC — stable locally-administered MAC from a UUID-ish string.
-fn uuid_to_mac(id: &str) -> String {
+// pub(crate): legacy.rs sends the same id as its pair-setup-pin user.
+pub(crate) fn uuid_to_mac(id: &str) -> String {
     let hex: String = id.to_lowercase().chars().filter(|c| *c != '-').collect();
     if hex.len() < 12 {
         return "02:00:00:00:00:01".to_string();
