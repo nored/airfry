@@ -112,6 +112,9 @@ pub struct Config {
     pub direct_key: bool,
     pub no_audio: bool,
     pub test_mode: bool,
+    /// Local port range the receiver calls back on (`--port-range`), so a
+    /// firewall can open it. `None`: ephemeral ports.
+    pub port_range: Option<(u16, u16)>,
 }
 
 impl Default for Config {
@@ -125,6 +128,7 @@ impl Default for Config {
             direct_key: false,
             no_audio: false,
             test_mode: false,
+            port_range: None,
         }
     }
 }
@@ -802,6 +806,7 @@ impl Daemon {
             no_audio: cfg.no_audio,
             direct_key: cfg.direct_key,
             test: cfg.test_mode,
+            port_range: cfg.port_range,
             ..Default::default()
         };
 
@@ -1105,11 +1110,12 @@ fn to_device_infos(devices: &[AirPlayDevice]) -> Vec<DeviceInfo> {
 /// Build and run an AirFry daemon on `socket_path` (or the default when
 /// `None`), blocking until shutdown. The self-contained entry point main.rs
 /// dispatches `--daemonize` to.
-pub fn run(socket_path: Option<PathBuf>) -> Result<()> {
+pub fn run(socket_path: Option<PathBuf>, port_range: Option<(u16, u16)>) -> Result<()> {
     let mut cfg = Config::default();
     if let Some(p) = socket_path {
         cfg.socket_path = p;
     }
+    cfg.port_range = port_range;
     let daemon = Daemon::new(cfg);
 
     // Clean shutdown on Ctrl-C / SIGTERM.
