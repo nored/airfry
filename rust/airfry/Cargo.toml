@@ -28,6 +28,10 @@ num-bigint = "0.4"
 num-traits = "0.2"
 rand = "0.8"
 aes = "0.8"
+# legacy AirPlay PIN pairing (UxPlay /pair-setup-pin): SRP-6a over SHA-1 and
+# the AES-128-GCM wrap of the ed25519 keys
+sha1 = "0.10"
+aes-gcm = "0.10"
 ctr = "0.9"
 cbc = "0.1"
 # Original (Bernstein "djb") ChaCha20 with a 64-bit nonce + Poly1305, used to
