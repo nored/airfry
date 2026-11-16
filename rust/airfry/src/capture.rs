@@ -29,7 +29,7 @@
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context, Result};
 use gstreamer as gst;
@@ -287,16 +287,19 @@ impl CaptureSource {
         // and the optional videoscale segment from the portal's native size.
         let scale = OutputScale::compute(cfg, src_w as i32, src_h as i32);
 
-        Self::build_wayland_pipeline(cfg, portal, &scale, false)
+        Self::build_wayland_pipeline(cfg, portal, &scale, false, false)
     }
 
     /// Build the Wayland pipeline. `force_software` forces the x264 encoder
-    /// (runtime retry path, capture.go:230-237 analogue).
+    /// (runtime retry path, capture.go:230-237 analogue). `import_dmabuf` puts
+    /// vapostproc after pipewiresrc, for a compositor that offers its stream
+    /// only as DMA-BUF (retry path when the plain pipeline is refused).
     fn build_wayland_pipeline(
         cfg: &CaptureConfig,
         portal: PortalSession,
         scale: &OutputScale,
         force_software: bool,
+        import_dmabuf: bool,
     ) -> Result<CaptureSource> {
         let fps = if cfg.fps == 0 { 30 } else { cfg.fps };
         let pipeline = gst::Pipeline::new();
@@ -323,23 +326,31 @@ impl CaptureSource {
         let rate_caps = framerate_caps(fps)?;
         let queue = leaky_queue()?;
 
-        let mut elems: Vec<gst::Element> = vec![
-            src.clone(),
+        let mut elems: Vec<gst::Element> = vec![src.clone()];
+        if import_dmabuf {
+            // vapostproc (VA-API) takes DMA-BUF, which videoconvert does not,
+            // and hands on frames in system memory.
+            elems.push(make("vapostproc")?);
+            elems.push(
+                gst::ElementFactory::make("capsfilter")
+                    .property("caps", gst::Caps::builder("video/x-raw").build())
+                    .build()
+                    .context("create video/x-raw capsfilter")?,
+            );
+        }
+        elems.extend([
             videoconvert.clone(),
             videorate.clone(),
             rate_caps.clone(),
             queue.clone(),
-        ];
+        ]);
 
         let (enc, eos, rx, live_fit) = Self::finish_pipeline(
             cfg, &pipeline, &mut elems, scale, fps, force_software,
         )?;
         let _ = enc;
 
-        pipeline
-            .set_state(gst::State::Playing)
-            .context("set pipeline PLAYING")?;
-
+        let started = pipeline.set_state(gst::State::Playing);
         let mut cap = CaptureSource {
             pipeline,
             rx,
@@ -348,15 +359,45 @@ impl CaptureSource {
             eos,
             live_fit,
         };
-        // No-frames fallback: if a hardware encoder builds but emits nothing,
-        // reclaim the portal, tear it down, and rebuild with software (x264).
-        if !force_software && !cap.probe_first_frame(Duration::from_secs(3)) {
-            crate::dlog!("[capture] hardware encoder produced no frames in 3s; falling back to software (x264)");
-            let portal = cap._portal.take();
-            cap.stop();
-            if let Some(portal) = portal {
-                return Self::build_wayland_pipeline(cfg, portal, scale, true);
+        let first = match started {
+            Ok(_) => cap.wait_first_frame(Duration::from_secs(3)),
+            // pipewiresrc can refuse its formats while the pipeline goes to
+            // PLAYING (GStreamer 1.28): the state change fails and the
+            // reason is on the bus.
+            Err(_) if format_refused_on_bus(&cap.pipeline, Duration::from_millis(500)) => {
+                FirstFrame::FormatRefused
             }
+            Err(e) => return Err(e).context("set pipeline PLAYING"),
+        };
+        match first {
+            FirstFrame::Arrived => {}
+            // A compositor that offers its stream only as DMA-BUF (niri)
+            // finds no format videoconvert takes, and pipewiresrc gives up.
+            // Rebuild on the same portal session with vapostproc in front.
+            FirstFrame::FormatRefused => {
+                if import_dmabuf {
+                    bail!("the screencast offers no format that vapostproc or videoconvert takes");
+                }
+                if gst::ElementFactory::find("vapostproc").is_none() {
+                    bail!("the screencast offers no format videoconvert takes (DMA-BUF only?) and vapostproc (gst-plugins-bad, VA-API) is not installed");
+                }
+                crate::dlog!("[capture] the screencast offers no format videoconvert takes (DMA-BUF only?); retrying with vapostproc");
+                let portal = cap._portal.take().context("portal session already taken")?;
+                cap.stop();
+                return Self::build_wayland_pipeline(cfg, portal, scale, force_software, true);
+            }
+            // No-frames fallback: if a hardware encoder builds but emits
+            // nothing, reclaim the portal, tear it down, and rebuild with
+            // software (x264).
+            _ if !force_software => {
+                crate::dlog!("[capture] hardware encoder produced no frames in 3s; falling back to software (x264)");
+                let portal = cap._portal.take();
+                cap.stop();
+                if let Some(portal) = portal {
+                    return Self::build_wayland_pipeline(cfg, portal, scale, true, import_dmabuf);
+                }
+            }
+            _ => {}
         }
         Ok(cap)
     }
@@ -565,6 +606,29 @@ impl CaptureSource {
         Ok((encoder, eos, rx, live_fit))
     }
 
+    /// Wait up to `timeout` for the first encoded chunk and stash it, like
+    /// `probe_first_frame`, watching the bus for a source that refuses every
+    /// format on the way.
+    fn wait_first_frame(&mut self, timeout: Duration) -> FirstFrame {
+        let deadline = Instant::now() + timeout;
+        loop {
+            match self.rx.recv_timeout(Duration::from_millis(50)) {
+                Ok(chunk) => {
+                    self.leftover = chunk;
+                    return FirstFrame::Arrived;
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => return FirstFrame::Missing,
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+            }
+            if format_refused_on_bus(&self.pipeline, Duration::ZERO) {
+                return FirstFrame::FormatRefused;
+            }
+            if Instant::now() >= deadline {
+                return FirstFrame::Missing;
+            }
+        }
+    }
+
     /// Wait up to `timeout` for the FIRST encoded chunk and stash it (so `read`
     /// returns it later). Returns true if a frame arrived. A hardware encoder
     /// that builds but emits nothing (e.g. vulkanh264enc on some NVIDIA stacks,
@@ -680,6 +744,88 @@ impl Drop for CaptureSource {
     fn drop(&mut self) {
         self.stop();
     }
+}
+
+/// What the first seconds of a capture pipeline showed.
+enum FirstFrame {
+    Arrived,
+    /// The source found no format its peer takes.
+    FormatRefused,
+    Missing,
+}
+
+/// True for the error a source posts when its peer takes none of the formats
+/// it offers: pipewiresrc says "no more input formats", and the streaming
+/// thread stops with not-negotiated.
+fn format_refused(err: &gst::glib::Error, debug: Option<&str>) -> bool {
+    err.matches(gst::StreamError::Format)
+        || err.matches(gst::CoreError::Negotiation)
+        || err.message().contains("no more input formats")
+        || debug.is_some_and(|d| d.contains("not-negotiated"))
+}
+
+#[cfg(test)]
+mod format_refused_tests {
+    use super::{format_refused, format_refused_on_bus};
+    use gst::prelude::*;
+    use gstreamer as gst;
+    use std::time::Duration;
+
+    #[test]
+    fn a_refused_format_is_recognised() {
+        // pipewiresrc's own error when the peer takes none of its formats.
+        let err = gst::glib::Error::new(gst::StreamError::Failed, "stream error: no more input formats");
+        assert!(format_refused(&err, None));
+        // The streaming thread's error that follows it.
+        let err = gst::glib::Error::new(gst::StreamError::Failed, "Internal data stream error.");
+        assert!(format_refused(&err, Some("streaming stopped, reason not-negotiated (-4)")));
+        assert!(format_refused(&gst::glib::Error::new(gst::CoreError::Negotiation, "x"), None));
+    }
+
+    #[test]
+    fn the_bus_reports_a_refused_format() {
+        gst::init().unwrap();
+        let pipeline = gst::Pipeline::new();
+        let post = |err: gst::StreamError, text: &str| {
+            let msg = gst::message::Error::builder(err, text).src(&pipeline).build();
+            pipeline.bus().unwrap().post(msg).unwrap();
+        };
+        assert!(!format_refused_on_bus(&pipeline, Duration::ZERO));
+        post(gst::StreamError::Failed, "Internal data stream error.");
+        post(gst::StreamError::Failed, "stream error: no more input formats");
+        assert!(format_refused_on_bus(&pipeline, Duration::from_millis(100)));
+        // The errors are taken: the bus is empty again.
+        assert!(!format_refused_on_bus(&pipeline, Duration::ZERO));
+        post(gst::StreamError::Failed, "Internal data stream error.");
+        assert!(!format_refused_on_bus(&pipeline, Duration::ZERO));
+    }
+
+    #[test]
+    fn other_errors_are_not_a_refused_format() {
+        let err = gst::glib::Error::new(gst::ResourceError::NotFound, "no such node");
+        assert!(!format_refused(&err, None));
+        let err = gst::glib::Error::new(gst::StreamError::Failed, "Internal data stream error.");
+        assert!(!format_refused(&err, Some("streaming stopped, reason error (-5)")));
+    }
+}
+
+/// Take the errors on the bus, waiting up to `wait` for the first one.
+/// True if one says the source refused every format.
+fn format_refused_on_bus(pipeline: &gst::Pipeline, wait: Duration) -> bool {
+    let Some(bus) = pipeline.bus() else {
+        return false;
+    };
+    let mut wait = gst::ClockTime::from_nseconds(wait.as_nanos() as u64);
+    let mut refused = false;
+    while let Some(msg) = bus.timed_pop_filtered(wait, &[gst::MessageType::Error]) {
+        wait = gst::ClockTime::ZERO;
+        if let gst::MessageView::Error(err) = msg.view() {
+            let debug = err.debug().map(|d| d.to_string());
+            crate::dlog!("[capture] pipeline error: {} ({})", err.error(), debug.as_deref().unwrap_or(""));
+            refused |= format_refused(&err.error(), debug.as_deref());
+        }
+    }
+    refused
 }
 
 fn make(name: &str) -> Result<gst::Element> {
