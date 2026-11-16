@@ -28,6 +28,7 @@
 
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -309,6 +310,7 @@ impl CaptureSource {
             .property("do-timestamp", true)
             .build()
             .context("create pipewiresrc (install gst-plugin-pipewire)")?;
+        restamp_stalled_frames(&src)?;
 
         // Wayland tail (capture.go:103-110):
         //   pipewiresrc ! videoconvert ! videorate drop-only skip-to-first
@@ -737,6 +739,101 @@ fn leaky_queue() -> Result<gst::Element> {
         .property_from_str("leaky", "downstream")
         .build()
         .context("create queue")
+}
+
+/// Give a frame whose PTS does not advance the running time it arrives at.
+///
+/// niri 25.11 stamps every screencast frame with the first frame's PTS, and
+/// pipewiresrc keeps the producer's PTS even with do-timestamp. videorate
+/// drop-only then takes every later frame for a duplicate and drops it, so the
+/// receiver gets one frame. A stalled frame gets the running time, at least one
+/// nanosecond past the frame before; frames whose PTS advances pass unchanged,
+/// so a source with correct timestamps is never touched.
+fn restamp_stalled_frames(src: &gst::Element) -> Result<()> {
+    const NONE: u64 = u64::MAX;
+    let last = AtomicU64::new(NONE);
+    let logged = AtomicBool::new(false);
+    src.static_pad("src")
+        .with_context(|| format!("{} has no src pad", src.name()))?
+        .add_probe(gst::PadProbeType::BUFFER, move |pad, info| {
+            let Some(gst::PadProbeData::Buffer(buffer)) = &mut info.data else {
+                return gst::PadProbeReturn::Ok;
+            };
+            let prev = last.load(Ordering::Relaxed);
+            match buffer.pts() {
+                Some(pts) if prev == NONE || pts.nseconds() > prev => {
+                    last.store(pts.nseconds(), Ordering::Relaxed);
+                }
+                stalled => {
+                    let Some(now) = pad.parent_element().and_then(|e| e.current_running_time()) else {
+                        return gst::PadProbeReturn::Ok;
+                    };
+                    let next = if prev == NONE { now.nseconds() } else { now.nseconds().max(prev + 1) };
+                    if !logged.swap(true, Ordering::Relaxed) {
+                        crate::dlog!("[capture] frame PTS does not advance ({stalled:?}); stamping stalled frames on arrival");
+                    }
+                    let buffer = buffer.make_mut();
+                    buffer.set_pts(gst::ClockTime::from_nseconds(next));
+                    buffer.set_dts(gst::ClockTime::NONE);
+                    last.store(next, Ordering::Relaxed);
+                }
+            }
+            gst::PadProbeReturn::Ok
+        });
+    Ok(())
+}
+
+#[cfg(test)]
+mod restamp_tests {
+    use super::restamp_stalled_frames;
+    use gstreamer as gst;
+    use gstreamer::prelude::*;
+    use gstreamer_app as gst_app;
+    use std::time::Duration;
+
+    /// Push frames with the given PTS (ms) through appsrc with the restamp
+    /// probe on its src pad; return the PTS (ns) appsink sees.
+    fn run(pts_ms: &[u64]) -> Vec<u64> {
+        gst::init().unwrap();
+        let pipeline = gst::Pipeline::new();
+        let src = gst_app::AppSrc::builder()
+            .is_live(true)
+            .format(gst::Format::Time)
+            .caps(&gst::Caps::builder("application/x-test").build())
+            .build();
+        let sink = gst_app::AppSink::builder().sync(false).build();
+        let src_elem = src.upcast_ref::<gst::Element>();
+        let sink_elem = sink.upcast_ref::<gst::Element>();
+        pipeline.add_many([src_elem, sink_elem]).unwrap();
+        src_elem.link(sink_elem).unwrap();
+        restamp_stalled_frames(src_elem).unwrap();
+        pipeline.set_state(gst::State::Playing).unwrap();
+        let mut out = Vec::new();
+        for &ms in pts_ms {
+            std::thread::sleep(Duration::from_millis(5));
+            let mut buffer = gst::Buffer::with_size(1).unwrap();
+            buffer.get_mut().unwrap().set_pts(gst::ClockTime::from_mseconds(ms));
+            src.push_buffer(buffer).unwrap();
+            let sample = sink.try_pull_sample(gst::ClockTime::from_seconds(2)).expect("sample");
+            out.push(sample.buffer().unwrap().pts().unwrap().nseconds());
+        }
+        pipeline.set_state(gst::State::Null).unwrap();
+        out
+    }
+
+    #[test]
+    fn stalled_timestamps_advance() {
+        // niri: every frame carries the first frame's PTS.
+        let out = run(&[18, 18, 18, 18, 18]);
+        assert_eq!(out[0], 18_000_000);
+        assert!(out.windows(2).all(|w| w[1] > w[0]), "{out:?}");
+    }
+
+    #[test]
+    fn advancing_timestamps_pass_unchanged() {
+        let out = run(&[0, 33, 66, 100]);
+        assert_eq!(out, vec![0, 33_000_000, 66_000_000, 100_000_000]);
+    }
 }
 
 /// OutputScale — the result of applyOutputScale (capture.go:587-641).
