@@ -99,7 +99,7 @@ fn print_help() {
            --test                 Use synthetic video (videotestsrc) for debugging\n  \
            --direct-key           Use shk/shiv directly without SHA-512 derivation\n  \
            --debug                Enable verbose debug logging\n  \
-           --daemonize            Run as a background daemon with a Unix socket\n  \
+           --daemonize            Run as a background daemon with a Unix socket; --fps,\n                         --bitrate, --sw, --no-encrypt, --no-audio, --test,\n                         --direct-key and --port-range apply to its streams\n  \
            --socket <path>        Unix socket path for the daemon control interface",
         ver = env!("CARGO_PKG_VERSION")
     );
@@ -538,7 +538,7 @@ fn cmd_daemon(args: &[String]) -> i32 {
         eprintln!("{e}");
         return 2;
     }
-    match daemon::run(flags.socket_path) {
+    match daemon::run(daemon::Config::from_flags(flags.socket_path, &flags.opts)) {
         Ok(()) => 0,
         Err(e) => {
             eprintln!("daemon error: {e:#}");

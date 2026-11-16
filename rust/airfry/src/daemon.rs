@@ -112,6 +112,9 @@ pub struct Config {
     pub direct_key: bool,
     pub no_audio: bool,
     pub test_mode: bool,
+    /// Local port range the receiver calls back on (`--port-range`), so a
+    /// firewall can open it. `None`: ephemeral ports.
+    pub port_range: Option<(u16, u16)>,
 }
 
 impl Default for Config {
@@ -125,7 +128,31 @@ impl Default for Config {
             direct_key: false,
             no_audio: false,
             test_mode: false,
+            port_range: None,
         }
+    }
+}
+
+impl Config {
+    /// The daemon's settings from the command line: `airfry daemon` takes the
+    /// same stream flags as `airfry mirror` (`--fps`, `--bitrate`, `--sw`,
+    /// `--no-encrypt`, `--direct-key`, `--no-audio`, `--test`, `--port-range`).
+    pub fn from_flags(socket_path: Option<PathBuf>, opts: &MirrorOpts) -> Config {
+        let mut cfg = Config {
+            fps: opts.fps,
+            bitrate_kbps: opts.bitrate_kbps,
+            force_software: opts.force_software_encoder,
+            no_encrypt: opts.no_encrypt,
+            direct_key: opts.direct_key,
+            no_audio: opts.no_audio,
+            test_mode: opts.test,
+            port_range: opts.port_range,
+            ..Config::default()
+        };
+        if let Some(p) = socket_path {
+            cfg.socket_path = p;
+        }
+        cfg
     }
 }
 
@@ -802,6 +829,7 @@ impl Daemon {
             no_audio: cfg.no_audio,
             direct_key: cfg.direct_key,
             test: cfg.test_mode,
+            port_range: cfg.port_range,
             ..Default::default()
         };
 
@@ -1102,14 +1130,9 @@ fn to_device_infos(devices: &[AirPlayDevice]) -> Vec<DeviceInfo> {
 // Public entry point used by main.rs (`--daemonize` dispatch)
 // ---------------------------------------------------------------------------
 
-/// Build and run an AirFry daemon on `socket_path` (or the default when
-/// `None`), blocking until shutdown. The self-contained entry point main.rs
-/// dispatches `--daemonize` to.
-pub fn run(socket_path: Option<PathBuf>) -> Result<()> {
-    let mut cfg = Config::default();
-    if let Some(p) = socket_path {
-        cfg.socket_path = p;
-    }
+/// Build and run an AirFry daemon with `cfg`, blocking until shutdown. The
+/// self-contained entry point main.rs dispatches `--daemonize` to.
+pub fn run(cfg: Config) -> Result<()> {
     let daemon = Daemon::new(cfg);
 
     // Clean shutdown on Ctrl-C / SIGTERM.
@@ -1130,6 +1153,35 @@ pub fn run(socket_path: Option<PathBuf>) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn config_takes_the_stream_flags() {
+        let opts = MirrorOpts {
+            fps: 60,
+            bitrate_kbps: 8000,
+            force_software_encoder: true,
+            no_encrypt: true,
+            direct_key: true,
+            no_audio: true,
+            test: true,
+            port_range: Some((6100, 6119)),
+            ..MirrorOpts::default()
+        };
+        let cfg = Config::from_flags(Some(PathBuf::from("/tmp/airfry-test.sock")), &opts);
+        assert_eq!(cfg.socket_path, PathBuf::from("/tmp/airfry-test.sock"));
+        assert_eq!((cfg.fps, cfg.bitrate_kbps), (60, 8000));
+        assert!(cfg.force_software && cfg.no_encrypt && cfg.direct_key && cfg.no_audio && cfg.test_mode);
+        assert_eq!(cfg.port_range, Some((6100, 6119)));
+    }
+
+    #[test]
+    fn config_without_flags_is_the_default() {
+        // socket_path is left out: its default follows $XDG_RUNTIME_DIR, which
+        // other tests change while this one runs.
+        let cfg = Config::from_flags(None, &MirrorOpts::default());
+        let def = Config::default();
+        assert_eq!((cfg.fps, cfg.bitrate_kbps, cfg.test_mode, cfg.port_range), (def.fps, def.bitrate_kbps, def.test_mode, def.port_range));
+    }
 
     #[test]
     fn request_serializes_with_go_field_names() {
