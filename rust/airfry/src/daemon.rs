@@ -607,6 +607,23 @@ impl Daemon {
         self.resume_pending_locked(inner, req.pin)
     }
 
+    /// Park `target`'s stream until its PIN arrives: the daemon reports
+    /// pin_required, and so does that stream, so a client can tell which
+    /// receiver shows the PIN. Must be called with `inner` held.
+    fn park_for_pin_locked(
+        inner: &mut Inner,
+        target: &str,
+        port: i32,
+        pin_tx: Sender<Option<String>>,
+    ) {
+        inner.pending_target = target.to_string();
+        inner.pending_port = port;
+        if let Some(entry) = inner.streams.get_mut(target) {
+            entry.pin_tx = Some(pin_tx);
+            entry.state = STATE_PIN_REQUIRED;
+        }
+    }
+
     /// Resume the parked target with the supplied PIN. Must be called holding
     /// the `inner` guard, which it consumes. Mirrors daemon.go: clears
     /// pendingTarget/pendingPort and delivers the code to the parked worker
@@ -623,6 +640,7 @@ impl Daemon {
         // when it hit the PIN prompt; hand it the code to resume in place.
         if let Some(entry) = inner.streams.get_mut(&target) {
             if let Some(tx) = entry.pin_tx.take() {
+                entry.state = STATE_CONNECTING;
                 let _ = tx.send(Some(pin));
                 let overall = Self::overall_state_locked(&inner).to_string();
                 return Response {
@@ -703,11 +721,7 @@ impl Daemon {
             if !already_parked {
                 already_parked = true;
                 let mut inner = me_for_pin.inner.lock().unwrap();
-                inner.pending_target = target_for_pin.clone();
-                inner.pending_port = port;
-                if let Some(entry) = inner.streams.get_mut(&target_for_pin) {
-                    entry.pin_tx = Some(pin_tx.clone());
-                }
+                Self::park_for_pin_locked(&mut inner, &target_for_pin, port, pin_tx.clone());
                 crate::dlog!(
                     "[daemon] PIN required for {target_for_pin} — waiting for user input"
                 );
@@ -1440,5 +1454,54 @@ mod tests {
             Some(v) => std::env::set_var("XDG_RUNTIME_DIR", v),
             None => std::env::remove_var("XDG_RUNTIME_DIR"),
         }
+    }
+
+    #[test]
+    fn a_parked_stream_reports_pin_required_until_its_pin_arrives() {
+        let mut cfg = Config::default();
+        cfg.socket_path = std::env::temp_dir().join(format!("airfry-pin-{}.sock", std::process::id()));
+        let daemon = Daemon::new(cfg);
+        let mut inner = daemon.inner.lock().unwrap();
+        for ip in ["10.0.0.7", "10.0.0.8"] {
+            inner.streams.insert(
+                ip.to_string(),
+                ActiveStream {
+                    device: String::new(),
+                    device_ip: ip.to_string(),
+                    device_id: String::new(),
+                    state: STATE_CONNECTING,
+                    audio_muted: false,
+                    has_audio: false,
+                    control: MirrorControl::new(),
+                    pin_tx: None,
+                    has_sink: false,
+                },
+            );
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        Daemon::park_for_pin_locked(&mut inner, "10.0.0.8", 7000, tx);
+
+        let status = Daemon::status_response_locked(&inner, true, "");
+        assert!(status.needs_pin);
+        let states: Vec<(String, String)> = status
+            .streams
+            .unwrap()
+            .into_iter()
+            .map(|s| (s.device_ip, s.state))
+            .collect();
+        assert_eq!(
+            states,
+            vec![
+                ("10.0.0.7".to_string(), STATE_CONNECTING.to_string()),
+                ("10.0.0.8".to_string(), STATE_PIN_REQUIRED.to_string()),
+            ]
+        );
+
+        let resp = daemon.resume_pending_locked(inner, "1234".to_string());
+        assert!(resp.ok);
+        assert_eq!(rx.recv().unwrap().as_deref(), Some("1234"));
+        let inner = daemon.inner.lock().unwrap();
+        assert_eq!(inner.streams["10.0.0.8"].state, STATE_CONNECTING);
+        assert!(!Daemon::status_response_locked(&inner, true, "").needs_pin);
     }
 }
