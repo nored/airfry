@@ -746,7 +746,10 @@ impl Daemon {
         // to get here starts it, later streams just add a sink. Must be called
         // WITHOUT the daemon lock held (it does its own locking and spawns the
         // pump thread), exactly like Go.
-        let sink = match self.get_or_start_broadcast(&cfg) {
+        // The first receiver sets the size of the shared capture; a receiver
+        // that joins later gets frames at that size.
+        let display = session.info.display_size();
+        let sink = match self.get_or_start_broadcast(&cfg, display) {
             Ok(sink) => sink,
             Err(e) => {
                 crate::dlog!("[daemon] capture failed for {target}: {e:#}");
@@ -864,7 +867,11 @@ impl Daemon {
     /// the pump thread, and stores both the broadcast and a detached stop handle
     /// in daemon state. A double-check after building (mirroring Go) discards a
     /// race-built capture if another worker won.
-    fn get_or_start_broadcast(self: &Arc<Self>, cfg: &Config) -> Result<crate::broadcast::BroadcastSink> {
+    fn get_or_start_broadcast(
+        self: &Arc<Self>,
+        cfg: &Config,
+        display: (u32, u32),
+    ) -> Result<crate::broadcast::BroadcastSink> {
         // Fast path: a capture is already running — add a sink (daemon.go).
         {
             let inner = self.inner.lock().unwrap();
@@ -882,6 +889,7 @@ impl Daemon {
             live_underscan: false,
             force_software: cfg.force_software,
             test: cfg.test_mode,
+            max_size: display,
             restore_token: None,
             on_restore_token: None,
         };
@@ -1361,7 +1369,7 @@ mod tests {
 
         register("10.0.0.1");
         let cfg = daemon.inner.lock().unwrap().cfg.clone();
-        let sink1 = match daemon.get_or_start_broadcast(&cfg) {
+        let sink1 = match daemon.get_or_start_broadcast(&cfg, (0, 0)) {
             Ok(s) => s,
             Err(e) => {
                 crate::dlog!("skip shared_capture test: capture unavailable: {e:#}");
@@ -1375,7 +1383,7 @@ mod tests {
 
         // Second stream reuses the SAME capture (no new BroadcastCapture).
         register("10.0.0.2");
-        let sink2 = daemon.get_or_start_broadcast(&cfg).expect("second sink");
+        let sink2 = daemon.get_or_start_broadcast(&cfg, (0, 0)).expect("second sink");
         let bc_ptr2 = Arc::as_ptr(daemon.inner.lock().unwrap().broadcast.as_ref().unwrap());
         assert_eq!(bc_ptr, bc_ptr2, "second stream must reuse the shared capture");
 
@@ -1414,7 +1422,7 @@ mod tests {
 
         // A later connect can start a fresh capture again.
         register("10.0.0.3");
-        let sink3 = daemon.get_or_start_broadcast(&cfg).expect("fresh capture");
+        let sink3 = daemon.get_or_start_broadcast(&cfg, (0, 0)).expect("fresh capture");
         assert!(daemon.inner.lock().unwrap().broadcast.is_some());
         drop(sink3);
         {

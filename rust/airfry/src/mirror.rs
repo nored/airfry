@@ -1700,6 +1700,7 @@ pub fn run_mirror_with_source(
                 live_underscan: opts.live_underscan,
                 force_software: opts.force_software_encoder,
                 test: opts.test,
+                max_size: (display_w, display_h),
                 restore_token: None,
                 on_restore_token: None,
             };
